@@ -1,0 +1,707 @@
+-- Roblox client adapter and UI. Core is embedded above this file by scripts/build.py.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local Input = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local player = Players.LocalPlayer
+assert(player, "Speedsters Beyond must be loaded on the client")
+local playerGui = player:WaitForChild("PlayerGui", 10)
+assert(playerGui, "PlayerGui did not load; retry after joining the game")
+
+local shared = type(getgenv) == "function" and getgenv() or _G
+local previous = shared.SpeedstersBeyondSession
+if type(previous) == "table" and type(previous.destroy) == "function" then
+    pcall(previous.destroy)
+end
+-- Quiesce the feature flags used by the user's original script when upgrading in-session.
+for _, key in ipairs({ "AutoFarmState", "AutoOrbsState", "AutoJobState", "AutoRaceState", "AutoAscendState", "AutoBuyState" }) do
+    if shared[key] ~= nil then shared[key] = false end
+end
+
+local parentGui = playerGui
+local ok, hiddenGui = pcall(function()
+    return type(gethui) == "function" and gethui() or game:GetService("CoreGui")
+end)
+if ok and hiddenGui then
+    local probe = Instance.new("Folder")
+    local writable = pcall(function() probe.Parent = hiddenGui end)
+    probe:Destroy()
+    if writable then parentGui = hiddenGui end
+end
+for _, parent in ipairs(parentGui == playerGui and { playerGui } or { playerGui, parentGui }) do
+    local old = parent:FindFirstChild("SpeedstersBeyondHub")
+    if old then
+        local shutdown = old:FindFirstChild("Shutdown")
+        if shutdown and shutdown:IsA("BindableEvent") then shutdown:Fire() end
+        old:Destroy()
+    end
+end
+
+local session = { alive = true, connections = {}, threads = {}, tweens = {} }
+shared.SpeedstersBeyondSession = session
+local engine
+local gui
+local function connect(signal, callback)
+    local connection = signal:Connect(function(...)
+        if session.alive then callback(...) end
+    end)
+    table.insert(session.connections, connection)
+    return connection
+end
+function session.destroy()
+    if not session.alive then return end
+    session.alive = false
+    if engine then engine:destroy() end
+    for _, connection in ipairs(session.connections) do connection:Disconnect() end
+    for _, thread in ipairs(session.threads) do
+        if coroutine.status(thread) ~= "dead" then pcall(task.cancel, thread) end
+    end
+    for _, tween in pairs(session.tweens) do tween:Cancel() end
+    if gui then gui:Destroy() end
+    if shared.SpeedstersBeyondSession == session then shared.SpeedstersBeyondSession = nil end
+end
+
+local palette = {
+    bg = Color3.fromRGB(12, 16, 25),
+    panel = Color3.fromRGB(18, 24, 37),
+    card = Color3.fromRGB(23, 31, 46),
+    stroke = Color3.fromRGB(45, 59, 78),
+    text = Color3.fromRGB(237, 244, 255),
+    muted = Color3.fromRGB(151, 170, 193),
+    accent = Color3.fromRGB(83, 238, 205),
+    blue = Color3.fromRGB(92, 156, 255),
+    purple = Color3.fromRGB(164, 126, 255),
+    warning = Color3.fromRGB(255, 193, 111),
+    red = Color3.fromRGB(255, 116, 139),
+}
+local function create(class, props, parent)
+    local object = Instance.new(class)
+    for key, value in pairs(props or {}) do object[key] = value end
+    object.Parent = parent
+    return object
+end
+local function round(object, radius)
+    local corner = object:FindFirstChildOfClass("UICorner") or create("UICorner", {}, object)
+    corner.CornerRadius = UDim.new(0, radius or 12)
+end
+local function stroke(object, color, transparency)
+    return create("UIStroke", { Color = color or palette.stroke, Transparency = transparency or 0, Thickness = 1 }, object)
+end
+local function animate(object, props)
+    -- Keep at most one tween per widget; rapid toggles cannot finish out of order.
+    if session.tweens[object] then session.tweens[object]:Cancel() end
+    local tween = TweenService:Create(object, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props)
+    session.tweens[object] = tween
+    tween:Play()
+end
+local function label(parent, text, size, color, bold)
+    return create("TextLabel", {
+        BackgroundTransparency = 1, BorderSizePixel = 0, Text = text,
+        Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham,
+        TextSize = size or 13, TextColor3 = color or palette.text,
+        TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, parent)
+end
+local function button(parent, text, color)
+    local item = create("TextButton", {
+        BorderSizePixel = 0, BackgroundColor3 = color or palette.card,
+        TextColor3 = palette.text, Font = Enum.Font.GothamMedium, TextSize = 13,
+        Text = text, AutoButtonColor = false,
+    }, parent)
+    round(item, 8)
+    connect(item.MouseEnter, function() animate(item, { BackgroundTransparency = 0.2 }) end)
+    connect(item.MouseLeave, function() animate(item, { BackgroundTransparency = 0 }) end)
+    return item
+end
+local function padding(parent, amount)
+    create("UIPadding", {
+        PaddingLeft = UDim.new(0, amount), PaddingRight = UDim.new(0, amount),
+        PaddingTop = UDim.new(0, amount), PaddingBottom = UDim.new(0, amount),
+    }, parent)
+end
+local function stack(parent, gap)
+    create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, gap or 10) }, parent)
+end
+
+local events = {}
+local eventLabel
+local startedAt = os.clock()
+local function log(text, problem)
+    table.insert(events, 1, string.format("%02d:%02d  %s", math.floor((os.clock() - startedAt) / 60), math.floor((os.clock() - startedAt) % 60), text))
+    while #events > 6 do table.remove(events) end
+    if eventLabel then eventLabel.Text = table.concat(events, "\n") end
+    if problem then warn("[Speedsters Beyond] " .. text) end
+end
+
+local function remote(name)
+    local folder = ReplicatedStorage:FindFirstChild("Remotes")
+    local item = folder and folder:FindFirstChild(name)
+    if not item or not item:IsA("RemoteEvent") then error("Missing RemoteEvent: " .. name, 0) end
+    return item
+end
+local function send(name, ...)
+    remote(name):FireServer(...)
+end
+local function root()
+    local character = player.Character
+    local part = character and character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not part or not part:IsA("BasePart") or not humanoid or humanoid.Health <= 0 then
+        error("Waiting for a living character", 0)
+    end
+    return part
+end
+local function location(value)
+    local kind = typeof(value)
+    if kind == "Vector3" then return CFrame.new(value) end
+    if kind == "CFrame" then return value end
+    if kind == "Instance" then
+        if value:IsA("BasePart") then return value.CFrame end
+        if value:IsA("Attachment") then return value.WorldCFrame end
+        if value:IsA("Model") and value:FindFirstChildWhichIsA("BasePart", true) then return value:GetPivot() end
+    end
+    error("Unsupported or missing destination", 0)
+end
+local function moveTo(value, distance, offset)
+    local part = root()
+    local target = location(value)
+    if (part.Position - target.Position).Magnitude > distance then
+        part.CFrame = target + Vector3.new(0, offset or 3, 0)
+        part.AssemblyLinearVelocity = Vector3.zero
+        part.AssemblyAngularVelocity = Vector3.zero
+    end
+end
+
+local controller = { script = nil, value = nil, loading = false, retry = 0, failure = nil }
+local function jobsController()
+    local scripts = player:FindFirstChild("PlayerScripts")
+    local controllers = scripts and scripts:FindFirstChild("Controllers")
+    local module = controllers and controllers:FindFirstChild("JobsController")
+    if not module or not module:IsA("ModuleScript") then error("Waiting for JobsController", 0) end
+    if controller.script ~= module then
+        controller = { script = module, value = nil, loading = false, retry = 0, failure = nil }
+    end
+    local current = controller
+    if current.value then return current.value end
+    if not current.loading and os.clock() >= current.retry then
+        current.loading = true
+        current.started = os.clock()
+        -- require can yield; keep it out of the shared automation loop.
+        local thread = task.spawn(function()
+            local loaded, result = pcall(require, module)
+            if not session.alive or controller ~= current then return end
+            current.loading = false
+            current.retry = os.clock() + 10
+            if loaded and type(result) == "table" and type(result.GetDropPoint) == "function" then
+                current.value = result
+            else
+                current.failure = loaded and "JobsController has no GetDropPoint method" or "JobsController could not load"
+                log(current.failure, true)
+            end
+        end)
+        table.insert(session.threads, thread)
+    end
+    if current.value then return current.value end
+    if current.loading and os.clock() - current.started > 10 then
+        error("JobsController is still loading; rejoin if this persists", 0)
+    end
+    error(current.failure or "Loading JobsController", 0)
+end
+
+local orbParts = {}
+local orbCooldown = setmetatable({}, { __mode = "k" })
+local orbsIndexed = false
+local function indexOrb(object)
+    if object:IsA("BasePart") and string.find(string.lower(object.Name), "orb", 1, true) then
+        orbParts[object] = true
+    end
+end
+local function ensureOrbIndex()
+    if orbsIndexed then return end
+    orbsIndexed = true
+    connect(workspace.DescendantAdded, indexOrb)
+    connect(workspace.DescendantRemoving, function(object) orbParts[object] = nil end)
+    for _, object in ipairs(workspace:GetDescendants()) do indexOrb(object) end
+end
+
+engine = Core.new({
+    onStatus = function(key, text, problem)
+        if problem then log(key .. ": " .. text, true) end
+    end,
+    moveToTreadmill = function(name)
+        remote("ChargeStart")
+        remote("ChargeBurst")
+        local folder = workspace:FindFirstChild("Treadmills")
+        local target = folder and folder:FindFirstChild(name)
+        if not target then error("Treadmill " .. name .. " is unavailable; select another", 0) end
+        moveTo(target, 7, 3)
+    end,
+    chargeStart = function() send("ChargeStart") end,
+    chargeBurst = function() send("ChargeBurst") end,
+    getDropPoint = function()
+        root()
+        local value = jobsController():GetDropPoint()
+        if value == nil or value == false then return nil end
+        return location(value)
+    end,
+    moveToBoard = function()
+        local geometry = workspace:FindFirstChild("ServerGeometry")
+        local board = workspace:FindFirstChild("JobsPart") or (geometry and geometry:FindFirstChild("JobsPart"))
+        if not board then error("Waiting for the job board to load", 0) end
+        -- Verify all three endpoints before accepting a delivery we cannot finish.
+        remote("ClaimJob")
+        remote("ReportJobArrival")
+        remote("CollectJob")
+        moveTo(board, 10, 3)
+    end,
+    claimJob = function(tier, slot) send("ClaimJob", tier, slot) end,
+    moveToDrop = function(drop) moveTo(drop, 8, 3) end,
+    reportArrival = function() send("ReportJobArrival") end,
+    collectJob = function() send("CollectJob") end,
+    collectNearestOrb = function()
+        local origin = root().Position
+        local collect = remote("OrbCollect")
+        ensureOrbIndex()
+        local nearest, nearestDistance = nil, 80
+        local now = os.clock()
+        for object in pairs(orbParts) do
+            if object:IsDescendantOf(workspace) and now >= (orbCooldown[object] or 0) then
+                local distance = (origin - object.Position).Magnitude
+                if distance < nearestDistance then nearest, nearestDistance = object, distance end
+            end
+        end
+        if not nearest then return false end
+        moveTo(nearest, 3, 0)
+        collect:FireServer(nearest)
+        orbCooldown[nearest] = now + 5
+        return true
+    end,
+    resetRace = function() root(); send("ResetRace") end,
+    ascend = function() root(); send("AscendRequest") end,
+    buyUpgrades = function()
+        local buy = remote("BuyUpgrade")
+        buy:FireServer("Speed")
+        buy:FireServer("Jump")
+    end,
+})
+session.engine = engine
+
+gui = create("ScreenGui", {
+    Name = "SpeedstersBeyondHub", ResetOnSpawn = false, IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 90,
+}, parentGui)
+local shutdown = create("BindableEvent", { Name = "Shutdown" }, gui)
+connect(shutdown.Event, session.destroy)
+connect(gui.Destroying, session.destroy)
+
+local window = create("Frame", { Name = "Window", BackgroundColor3 = palette.bg, BorderSizePixel = 0, ClipsDescendants = true }, gui)
+round(window, 16)
+stroke(window, palette.stroke)
+create("Frame", { Size = UDim2.new(1, -32, 0, 2), Position = UDim2.fromOffset(16, 0), BorderSizePixel = 0, BackgroundColor3 = palette.accent }, window)
+local header = create("Frame", { Size = UDim2.new(1, 0, 0, 70), BackgroundTransparency = 1, Active = true }, window)
+local mark = label(header, "SB", 19, palette.bg, true)
+mark.BackgroundTransparency = 0
+mark.BackgroundColor3 = palette.accent
+mark.TextXAlignment = Enum.TextXAlignment.Center
+mark.Size = UDim2.fromOffset(40, 40)
+mark.Position = UDim2.fromOffset(18, 15)
+round(mark, 12)
+local title = label(header, "SPEEDSTERS", 16, palette.text, true)
+title.Position = UDim2.fromOffset(70, 15)
+title.Size = UDim2.new(1, -170, 0, 23)
+local subtitle = label(header, "B E Y O N D   /   CONTROL CENTER", 9, palette.muted)
+subtitle.Position = UDim2.fromOffset(70, 38)
+subtitle.Size = UDim2.new(1, -170, 0, 18)
+local minimize = button(header, "−")
+minimize.Size = UDim2.fromOffset(32, 32)
+minimize.Position = UDim2.new(1, -88, 0, 19)
+local close = button(header, "×")
+close.TextColor3 = palette.red
+close.TextSize = 20
+close.Size = UDim2.fromOffset(32, 32)
+close.Position = UDim2.new(1, -48, 0, 19)
+connect(close.Activated, session.destroy)
+
+local nav = create("Frame", { BackgroundColor3 = palette.panel, BorderSizePixel = 0 }, window)
+local navHeading = label(nav, "WORKSPACE", 10, palette.muted, true)
+navHeading.Position = UDim2.fromOffset(18, 18)
+navHeading.Size = UDim2.fromOffset(130, 20)
+local navHint = label(nav, "One movement mode\nat a time.\n\nRight Shift to hide.", 11, palette.muted)
+navHint.TextWrapped = true
+navHint.TextTruncate = Enum.TextTruncate.None
+navHint.TextYAlignment = Enum.TextYAlignment.Top
+navHint.Position = UDim2.new(0, 18, 1, -112)
+navHint.Size = UDim2.new(1, -36, 0, 96)
+local content = create("Frame", { BackgroundTransparency = 1 }, window)
+local footer = create("Frame", { BackgroundColor3 = palette.panel, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 48), Position = UDim2.new(0, 0, 1, -48) }, window)
+local footerStatus = label(footer, "●  READY", 11, palette.accent, true)
+footerStatus.Position = UDim2.fromOffset(18, 0)
+footerStatus.Size = UDim2.new(1, -150, 1, 0)
+local stop = button(footer, "Stop all")
+stop.TextColor3 = palette.red
+stop.Size = UDim2.fromOffset(100, 30)
+stop.Position = UDim2.new(1, -118, 0, 9)
+local reopen = button(gui, "SB  /  Open", palette.panel)
+reopen.Size = UDim2.fromOffset(120, 42)
+reopen.Position = UDim2.fromOffset(12, 12)
+reopen.TextColor3 = palette.accent
+reopen.Visible = false
+stroke(reopen, palette.accent, 0.5)
+
+local pages, navButtons = {}, {}
+local selectedPage = "Home"
+local refreshControls = function() end
+local function selectPage(name)
+    selectedPage = name
+    for key, page in pairs(pages) do
+        page.Visible = key == name
+        animate(navButtons[key], { BackgroundColor3 = key == name and palette.card or palette.panel, TextColor3 = key == name and palette.accent or palette.muted })
+    end
+end
+for index, name in ipairs({ "Home", "Training", "Jobs", "Tools" }) do
+    local item = button(nav, name)
+    item.TextXAlignment = Enum.TextXAlignment.Left
+    padding(item, 12)
+    navButtons[name] = item
+    connect(item.Activated, function() selectPage(name) end)
+    local page = create("ScrollingFrame", {
+        Name = name, BackgroundTransparency = 1, BorderSizePixel = 0,
+        Size = UDim2.fromScale(1, 1), CanvasSize = UDim2.fromOffset(0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
+        ScrollBarThickness = 3, ScrollBarImageColor3 = palette.stroke, Visible = index == 1,
+    }, content)
+    padding(page, 16)
+    stack(page, 12)
+    pages[name] = page
+end
+local function heading(page, eyebrow, name, description)
+    local block = create("Frame", { Size = UDim2.new(1, 0, 0, 98), BackgroundTransparency = 1, LayoutOrder = 0 }, page)
+    local overline = label(block, eyebrow, 10, palette.accent, true)
+    overline.Size = UDim2.new(1, 0, 0, 18)
+    local nameLabel = label(block, name, 25, palette.text, true)
+    nameLabel.Position = UDim2.fromOffset(0, 22)
+    nameLabel.Size = UDim2.new(1, 0, 0, 32)
+    local desc = label(block, description, 12, palette.muted)
+    desc.Position = UDim2.fromOffset(0, 60)
+    desc.Size = UDim2.new(1, 0, 0, 36)
+    desc.TextWrapped = true
+    desc.TextTruncate = Enum.TextTruncate.None
+end
+local function card(parent, height, order)
+    local frame = create("Frame", { Size = UDim2.new(1, -3, 0, height), BackgroundColor3 = palette.card, BorderSizePixel = 0, LayoutOrder = order }, parent)
+    round(frame, 12)
+    stroke(frame, palette.stroke, 0.45)
+    return frame
+end
+local function paragraph(parent, text, height, order, color)
+    local item = card(parent, height, order)
+    local textLabel = label(item, text, 12, color or palette.muted)
+    textLabel.Position = UDim2.fromOffset(14, 10)
+    textLabel.Size = UDim2.new(1, -28, 1, -20)
+    textLabel.TextWrapped = true
+    textLabel.TextTruncate = Enum.TextTruncate.None
+    return item
+end
+
+local toggles = {}
+local function toggle(page, key, name, description, order, movement)
+    local item = card(page, 132, order)
+    local nameLabel = label(item, name, 14, palette.text, true)
+    nameLabel.Position = UDim2.fromOffset(14, 10)
+    nameLabel.Size = UDim2.new(1, -90, 0, 28)
+    local desc = label(item, description, 12, palette.muted)
+    desc.Position = UDim2.fromOffset(14, 44)
+    desc.Size = UDim2.new(1, -28, 0, 38)
+    desc.TextWrapped = true
+    desc.TextTruncate = Enum.TextTruncate.None
+    local state = label(item, "Off", 11, palette.muted)
+    state.Position = UDim2.fromOffset(14, 88)
+    state.Size = UDim2.new(1, -28, 0, 34)
+    state.TextWrapped = true
+    state.TextTruncate = Enum.TextTruncate.None
+    local switch = button(item, "")
+    switch.Size = UDim2.fromOffset(58, 30)
+    switch.Position = UDim2.new(1, -72, 0, 10)
+    switch.BackgroundColor3 = palette.stroke
+    round(switch, 15)
+    local knob = create("Frame", { Size = UDim2.fromOffset(22, 22), Position = UDim2.fromOffset(4, 4), BackgroundColor3 = palette.muted, BorderSizePixel = 0 }, switch)
+    round(knob, 11)
+    local entry = { switch = switch, knob = knob, state = state, movement = movement, last = nil, name = name }
+    toggles[key] = entry
+    connect(switch.Activated, function()
+        if movement then
+            if engine.mode == key then engine:setMode(nil) else engine:setMode(key) end
+        else
+            engine:setEnabled(key, not engine.enabled[key])
+        end
+        log(name .. ((movement and engine.mode == key or not movement and engine.enabled[key]) and " enabled" or " disabled"))
+        refreshControls()
+    end)
+end
+
+heading(pages.Home, "YOUR SESSION, IN FOCUS", "Find your flow.", "Training, deliveries and upgrades in one place. Every action has a visible status.")
+local hero = card(pages.Home, 118, 1)
+create("UIGradient", { Color = ColorSequence.new(palette.card, Color3.fromRGB(29, 53, 66)), Rotation = 25 }, hero)
+local heroCaption = label(hero, "MOVEMENT CONTROL", 10, palette.accent, true)
+heroCaption.Position = UDim2.fromOffset(16, 12)
+heroCaption.Size = UDim2.new(1, -32, 0, 20)
+local modeLabel = label(hero, "Standing by", 24, palette.text, true)
+modeLabel.Position = UDim2.fromOffset(16, 38)
+modeLabel.Size = UDim2.new(1, -32, 0, 30)
+local modeHint = label(hero, "Choose a mode to begin.", 12, palette.muted)
+modeHint.Position = UDim2.fromOffset(16, 76)
+modeHint.Size = UDim2.new(1, -32, 0, 28)
+local metrics = card(pages.Home, 76, 2)
+local elapsedLabel = label(metrics, "00:00", 20, palette.text, true)
+elapsedLabel.Position = UDim2.fromOffset(14, 8)
+elapsedLabel.Size = UDim2.new(0.5, -20, 0, 30)
+local elapsedCaption = label(metrics, "SESSION TIME", 10, palette.muted)
+elapsedCaption.Position = UDim2.fromOffset(14, 42)
+elapsedCaption.Size = UDim2.new(0.5, -20, 0, 20)
+local countLabel = label(metrics, "0", 20, palette.text, true)
+countLabel.Position = UDim2.new(0.5, 8, 0, 8)
+countLabel.Size = UDim2.new(0.5, -22, 0, 30)
+local countCaption = label(metrics, "DELIVERIES CLEARED", 10, palette.muted)
+countCaption.Position = UDim2.new(0.5, 8, 0, 42)
+countCaption.Size = UDim2.new(0.5, -22, 0, 20)
+local activity = card(pages.Home, 194, 3)
+local activityTitle = label(activity, "SESSION ACTIVITY", 10, palette.muted, true)
+activityTitle.Position = UDim2.fromOffset(14, 12)
+activityTitle.Size = UDim2.new(1, -28, 0, 20)
+eventLabel = label(activity, "Ready when you are.", 11, palette.muted)
+eventLabel.Position = UDim2.fromOffset(14, 40)
+eventLabel.Size = UDim2.new(1, -28, 1, -50)
+eventLabel.TextYAlignment = Enum.TextYAlignment.Top
+eventLabel.TextWrapped = true
+eventLabel.TextTruncate = Enum.TextTruncate.None
+activity.ClipsDescendants = true
+
+heading(pages.Training, "BUILD YOUR MOMENTUM", "Training lab", "Choose a treadmill or collect nearby orbs. Switching modes hands over movement automatically.")
+local selector = card(pages.Training, 100, 1)
+selector.ClipsDescendants = true
+local selectorTitle = label(selector, "TREADMILL", 10, palette.muted, true)
+selectorTitle.Position = UDim2.fromOffset(14, 8)
+selectorTitle.Size = UDim2.new(1, -28, 0, 20)
+local selected = button(selector, "x10   ·   Change")
+selected.Position = UDim2.fromOffset(14, 36)
+selected.Size = UDim2.new(1, -28, 0, 44)
+selected.BackgroundColor3 = palette.panel
+selected.TextColor3 = palette.accent
+local optionsList = create("ScrollingFrame", {
+    Position = UDim2.fromOffset(14, 88), Size = UDim2.new(1, -28, 0, 174),
+    BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false,
+    CanvasSize = UDim2.fromOffset(0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    ScrollBarThickness = 3, ScrollingDirection = Enum.ScrollingDirection.Y,
+}, selector)
+stack(optionsList, 4)
+local selectorOpen = false
+local optionButtons = {}
+local optionsSignature
+local function setSelectorOpen(value)
+    selectorOpen = value
+    optionsList.Visible = value
+    selector.Size = UDim2.new(1, -3, 0, value and 276 or 100)
+end
+local function refreshTreadmills()
+    local names, seen = {}, {}
+    local folder = workspace:FindFirstChild("Treadmills")
+    if folder then
+        for _, object in ipairs(folder:GetChildren()) do
+            if object:IsA("BasePart") or object:IsA("Model") then
+                seen[object.Name] = true
+                table.insert(names, object.Name)
+            end
+        end
+    end
+    if #names == 0 then
+        names = { "x2", "x3", "x4", "x6", "x10", "x20" }
+    end
+    table.sort(names, function(a, b)
+        local an, bn = tonumber(string.match(a, "%d+")) or 0, tonumber(string.match(b, "%d+")) or 0
+        return an < bn or an == bn and a < b
+    end)
+    local signature = table.concat(names, "\0") .. (next(seen) and "loaded" or "fallback")
+    if signature == optionsSignature then return end
+    optionsSignature = signature
+    for _, item in ipairs(optionButtons) do item:Destroy() end
+    table.clear(optionButtons)
+    for index, name in ipairs(names) do
+        local item = button(optionsList, name .. (seen[name] and "  ·  available" or "  ·  not loaded"), palette.panel)
+        item.Size = UDim2.new(1, -5, 0, 40)
+        item.LayoutOrder = index
+        table.insert(optionButtons, item)
+        connect(item.Activated, function()
+            engine.treadmill = name
+            engine.farmPhase = "start"
+            selected.Text = name .. "   ·   Change"
+            setSelectorOpen(false)
+            log("Treadmill selected: " .. name)
+        end)
+    end
+end
+connect(selected.Activated, function()
+    if not selectorOpen then refreshTreadmills() end
+    setSelectorOpen(not selectorOpen)
+end)
+toggle(pages.Training, "farm", "Treadmill training", "Moves to your selection and spaces charge / burst requests.", 2, true)
+toggle(pages.Training, "orbs", "Nearby orb collection", "Collects the nearest detected orb within 80 studs, with a retry cooldown.", 3, true)
+paragraph(pages.Training, "Treadmills refresh when you open the selector. Missing or streamed-out targets pause the action and show a retry status.", 94, 4)
+
+heading(pages.Jobs, "A SMOOTHER DELIVERY LOOP", "Jobs & delivery", "One request at a time. A delivery must appear before the controller heads to its destination.")
+toggle(pages.Jobs, "jobs", "Auto job & deliver", "Tries the supplied tiers in reward order and waits for acceptance.", 1, true)
+paragraph(pages.Jobs, "PRIORITY ORDER\nExtreme → Ancient Crystal → Long-Haul Cargo → Hard → Medium", 96, 2, palette.text)
+paragraph(pages.Jobs, "Rewards and tier IDs come from your original script. The server decides eligibility; this client has no live reward or ascension-requirement table.", 108, 3)
+paragraph(pages.Jobs, "During deliveries, race reset and ascension wait so they cannot interrupt movement. Purchases can continue in the background.", 94, 4)
+
+heading(pages.Tools, "SET THE PACE", "Background tools", "Independent controls, spaced requests and clear feedback. Everything starts off except idle prevention.")
+toggle(pages.Tools, "race", "Repeat race reset", "Requests ResetRace every 4 seconds. This does not complete races.", 1, false)
+toggle(pages.Tools, "ascend", "Auto ascend", "Requests ascension every 10 seconds; the server checks eligibility.", 2, false)
+toggle(pages.Tools, "buy", "Auto buy upgrades", "Requests Speed and Jump purchases every 5 seconds. Spends available currency.", 3, false)
+toggle(pages.Tools, "antiIdle", "Idle prevention", "Sends an idle input when supported by your client runtime.", 4, false)
+paragraph(pages.Tools, "Minimize or Right Shift hides the panel while automation continues. Close unloads the hub. Stop all disables every toggle, including idle prevention.", 108, 5)
+
+refreshControls = function()
+    for key, entry in pairs(toggles) do
+        local enabled = entry.movement and engine.mode == key or not entry.movement and engine.enabled[key]
+        if entry.last ~= enabled then
+            entry.last = enabled
+            animate(entry.switch, { BackgroundColor3 = enabled and palette.accent or palette.stroke })
+            animate(entry.knob, { Position = UDim2.fromOffset(enabled and 32 or 4, 4), BackgroundColor3 = enabled and palette.bg or palette.muted })
+        end
+        local status = engine.status[key]
+        entry.state.Text = enabled and (status and status.text or "Ready") or "Off"
+        entry.state.TextColor3 = enabled and (status and status.problem and palette.warning or palette.accent) or palette.muted
+    end
+    local names = { farm = "Treadmill training", orbs = "Orb collection", jobs = "Job deliveries" }
+    modeLabel.Text = names[engine.mode] or "Standing by"
+    local active = engine.mode and engine.status[engine.mode]
+    modeHint.Text = active and active.text or "Choose a movement mode to begin."
+    modeHint.TextColor3 = active and active.problem and palette.warning or palette.muted
+    local running, problems = 0, 0
+    for key, entry in pairs(toggles) do
+        if entry.last then
+            running = running + 1
+            if engine.status[key] and engine.status[key].problem then problems = problems + 1 end
+        end
+    end
+    footerStatus.Text = problems > 0 and "●  NEEDS ATTENTION" or running > 0 and ("●  " .. running .. " ACTIVE") or "●  ALL STOPPED"
+    footerStatus.TextColor3 = problems > 0 and palette.warning or palette.accent
+    local seconds = math.floor(os.clock() - startedAt)
+    elapsedLabel.Text = string.format("%02d:%02d", math.floor(seconds / 60), seconds % 60)
+    countLabel.Text = tostring(engine.deliveries)
+end
+connect(stop.Activated, function()
+    engine:stopAll()
+    log("All automation stopped")
+    refreshControls()
+end)
+local function showWindow(visible)
+    window.Visible = visible
+    reopen.Visible = not visible
+end
+connect(minimize.Activated, function() showWindow(false) end)
+connect(reopen.Activated, function() showWindow(true) end)
+connect(Input.InputBegan, function(input, processed)
+    if not processed and not Input:GetFocusedTextBox() and input.KeyCode == Enum.KeyCode.RightShift then
+        showWindow(not window.Visible)
+    end
+end)
+
+local viewSize = Vector2.new(900, 650)
+local windowSize = Vector2.new(850, 590)
+local placed = false
+local function clampPosition(position)
+    return Vector2.new(math.clamp(position.X, 8, math.max(8, viewSize.X - windowSize.X - 8)), math.clamp(position.Y, 8, math.max(8, viewSize.Y - windowSize.Y - 8)))
+end
+local function layout()
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    viewSize = camera.ViewportSize
+    if viewSize.X < 1 or viewSize.Y < 1 then return end
+    windowSize = Vector2.new(math.min(860, viewSize.X - 16), math.min(650, viewSize.Y - 16))
+    window.Size = UDim2.fromOffset(windowSize.X, windowSize.Y)
+    local compact = windowSize.X < 640
+    navHeading.Visible = not compact
+    navHint.Visible = not compact
+    if compact then
+        nav.Position = UDim2.fromOffset(0, 70)
+        nav.Size = UDim2.new(1, 0, 0, 48)
+        content.Position = UDim2.fromOffset(0, 118)
+        content.Size = UDim2.new(1, 0, 1, -166)
+    else
+        nav.Position = UDim2.fromOffset(0, 70)
+        nav.Size = UDim2.new(0, 166, 1, -118)
+        content.Position = UDim2.fromOffset(166, 70)
+        content.Size = UDim2.new(1, -166, 1, -118)
+    end
+    for index, name in ipairs({ "Home", "Training", "Jobs", "Tools" }) do
+        local item = navButtons[name]
+        item.Position = compact and UDim2.new((index - 1) / 4, 4, 0, 5) or UDim2.fromOffset(10, 48 + (index - 1) * 48)
+        item.Size = compact and UDim2.new(0.25, -8, 0, 38) or UDim2.fromOffset(146, 40)
+        item.TextXAlignment = compact and Enum.TextXAlignment.Center or Enum.TextXAlignment.Left
+        item.TextSize = compact and 11 or 13
+    end
+    local position = placed and Vector2.new(window.Position.X.Offset, window.Position.Y.Offset) or (viewSize - windowSize) / 2
+    position = clampPosition(position)
+    window.Position = UDim2.fromOffset(position.X, position.Y)
+    placed = true
+end
+local cameraConnection
+local function bindCamera()
+    if cameraConnection then cameraConnection:Disconnect() end
+    if workspace.CurrentCamera then cameraConnection = connect(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"), layout) end
+    layout()
+end
+connect(workspace:GetPropertyChangedSignal("CurrentCamera"), bindCamera)
+bindCamera()
+local drag
+connect(header.InputBegan, function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    -- Keep minimize/close clicks out of the drag region.
+    if input.Position.X >= close.AbsolutePosition.X - 44 then return end
+    drag = { input = input, start = Vector2.new(input.Position.X, input.Position.Y), origin = Vector2.new(window.Position.X.Offset, window.Position.Y.Offset) }
+end)
+connect(Input.InputChanged, function(input)
+    if not drag then return end
+    if drag.input.UserInputType == Enum.UserInputType.Touch then
+        if input ~= drag.input then return end
+    elseif input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+    local position = clampPosition(drag.origin + Vector2.new(input.Position.X, input.Position.Y) - drag.start)
+    window.Position = UDim2.fromOffset(position.X, position.Y)
+end)
+connect(Input.InputEnded, function(input)
+    if drag and (input == drag.input or input.UserInputType == Enum.UserInputType.MouseButton1) then drag = nil end
+end)
+connect(player.Idled, function()
+    if not engine.enabled.antiIdle then return end
+    local idleOk = pcall(function()
+        local virtualUser = game:GetService("VirtualUser")
+        virtualUser:CaptureController()
+        virtualUser:ClickButton2(Vector2.zero)
+    end)
+    if idleOk then engine:report("antiIdle", "Idle input sent")
+    else engine:report("antiIdle", "Idle input unavailable in this runtime", true) end
+    refreshControls()
+end)
+connect(player.CharacterAdded, function()
+    engine.farmPhase = "start"
+    -- A respawn may cancel a job. Re-observe it instead of counting a stale collection.
+    engine.jobs = { phase = "idle", index = 1 }
+    engine.due.movement = 0
+    log("Character respawned · reacquiring targets")
+end)
+local accumulated = 0
+connect(RunService.Heartbeat, function(dt)
+    accumulated = accumulated + dt
+    if accumulated < 0.15 then return end
+    accumulated = 0
+    engine:tick(os.clock())
+    refreshControls()
+end)
+selectPage(selectedPage)
+refreshControls()
+log("Control center loaded · movement modes are off")
+print("[Speedsters Beyond] Loaded. Right Shift toggles the panel; close unloads this session.")
+return session
