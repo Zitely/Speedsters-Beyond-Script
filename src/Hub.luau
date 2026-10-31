@@ -210,6 +210,31 @@ local function jobsController()
     error(current.failure or "Loading JobsController", 0)
 end
 
+local ascensionOverride
+local function readAscensions()
+    if ascensionOverride ~= nil then return ascensionOverride, "manual" end
+    local detected
+    local function consider(value)
+        local number = tonumber(value)
+        if not number or number < 0 or number >= math.huge or number % 1 ~= 0 then return end
+        if detected ~= nil and detected ~= number then
+            error("Conflicting ascension counts · enter your current count below", 0)
+        end
+        detected = number
+    end
+    consider(player:GetAttribute("Ascensions"))
+    consider(player:GetAttribute("Ascension"))
+    -- Attribute and ValueObject paths differ across game versions. Never default a missing stat to 0.
+    for _, item in ipairs(player:GetDescendants()) do
+        local name = string.lower(item.Name)
+        if (name == "ascensions" or name == "ascension") and (item:IsA("IntValue") or item:IsA("NumberValue") or item:IsA("StringValue")) then
+            consider(item.Value)
+        end
+    end
+    if detected == nil then error("Ascensions unavailable · enter your current count below", 0) end
+    return detected, "detected"
+end
+
 local orbParts = {}
 local orbCooldown = setmetatable({}, { __mode = "k" })
 local orbsIndexed = false
@@ -240,6 +265,7 @@ engine = Core.new({
     end,
     chargeStart = function() send("ChargeStart") end,
     chargeBurst = function() send("ChargeBurst") end,
+    getAscensions = readAscensions,
     getDropPoint = function()
         root()
         local value = jobsController():GetDropPoint()
@@ -550,9 +576,57 @@ toggle(pages.Training, "orbs", "Nearby orb collection", "Collects the nearest de
 paragraph(pages.Training, "Treadmills refresh when you open the selector. Missing or streamed-out targets pause the action and show a retry status.", 94, 4)
 
 heading(pages.Jobs, "A SMOOTHER DELIVERY LOOP", "Jobs & delivery", "One request at a time. A delivery must appear before the controller heads to its destination.")
-toggle(pages.Jobs, "jobs", "Auto job & deliver", "Tries the supplied tiers in reward order and waits for acceptance.", 1, true)
-paragraph(pages.Jobs, "PRIORITY ORDER\nExtreme → Ancient Crystal → Long-Haul Cargo → Hard → Medium", 96, 2, palette.text)
-paragraph(pages.Jobs, "Rewards and tier IDs come from your original script. The server decides eligibility; this client has no live reward or ascension-requirement table.", 108, 3)
+toggle(pages.Jobs, "jobs", "Auto job & deliver", "Picks the highest-paying tier unlocked by your ascensions, then delivers and collects.", 1, true)
+local jobSelection = card(pages.Jobs, 224, 2)
+local jobSelectionTitle = label(jobSelection, "BEST ELIGIBLE JOB", 10, palette.muted, true)
+jobSelectionTitle.Position = UDim2.fromOffset(14, 10)
+jobSelectionTitle.Size = UDim2.new(1, -28, 0, 20)
+local jobPreview = label(jobSelection, "Checking ascensions…", 12, palette.accent)
+jobPreview.Position = UDim2.fromOffset(14, 34)
+jobPreview.Size = UDim2.new(1, -28, 0, 48)
+jobPreview.TextWrapped = true
+jobPreview.TextTruncate = Enum.TextTruncate.None
+local countInput = create("TextBox", {
+    Name = "AscensionCount", Text = "", PlaceholderText = "Current ascensions", ClearTextOnFocus = false,
+    Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = palette.text, PlaceholderColor3 = palette.muted,
+    BackgroundColor3 = palette.panel, BorderSizePixel = 0,
+    Position = UDim2.fromOffset(14, 92), Size = UDim2.new(1, -132, 0, 40),
+}, jobSelection)
+round(countInput, 8)
+local useCount = button(jobSelection, "Use count", palette.panel)
+useCount.Position = UDim2.new(1, -108, 0, 92)
+useCount.Size = UDim2.fromOffset(94, 40)
+local detectCount = button(jobSelection, "Use automatic detection", palette.panel)
+detectCount.Position = UDim2.fromOffset(14, 142)
+detectCount.Size = UDim2.new(1, -28, 0, 36)
+local countNote = label(jobSelection, "Manual count is optional. Keep it current if you use it.", 11, palette.muted)
+countNote.Position = UDim2.fromOffset(14, 184)
+countNote.Size = UDim2.new(1, -28, 0, 30)
+countNote.TextWrapped = true
+countNote.TextTruncate = Enum.TextTruncate.None
+local lastStatRefresh = -math.huge
+connect(useCount.Activated, function()
+    local value = tonumber(countInput.Text)
+    local valid = pcall(Core.bestJob, value)
+    if not valid then
+        jobPreview.Text = "Enter a whole ascension count of 0 or more."
+        jobPreview.TextColor3 = palette.warning
+        return
+    end
+    ascensionOverride = value
+    lastStatRefresh = -math.huge
+    engine.due.movement = 0
+    log("Manual ascension count set to " .. value)
+    refreshControls()
+end)
+connect(detectCount.Activated, function()
+    ascensionOverride = nil
+    countInput.Text = ""
+    lastStatRefresh = -math.huge
+    engine.due.movement = 0
+    refreshControls()
+end)
+paragraph(pages.Jobs, "At 10 ascensions, Hard pays 10,000. Locked tiers are skipped. If a claim is not confirmed, the hub waits instead of downgrading to Easy.", 108, 3)
 paragraph(pages.Jobs, "During deliveries, race reset and ascension wait so they cannot interrupt movement. Purchases can continue in the background.", 94, 4)
 
 heading(pages.Tools, "SET THE PACE", "Background tools", "Independent controls, spaced requests and clear feedback. Everything starts off except idle prevention.")
@@ -563,6 +637,18 @@ toggle(pages.Tools, "antiIdle", "Idle prevention", "Sends an idle input when sup
 paragraph(pages.Tools, "Minimize or Right Shift hides the panel while automation continues. Close unloads the hub. Stop all disables every toggle, including idle prevention.", 108, 5)
 
 refreshControls = function()
+    if os.clock() - lastStatRefresh >= 1 then
+        lastStatRefresh = os.clock()
+        local statOK, count, source = pcall(readAscensions)
+        if statOK then
+            local candidate = Core.bestJob(count)
+            jobPreview.Text = string.format("%d ascensions (%s)\n%s · %s reward", count, source, candidate.name, tostring(candidate.reward))
+            jobPreview.TextColor3 = palette.accent
+        else
+            jobPreview.Text = tostring(count)
+            jobPreview.TextColor3 = palette.warning
+        end
+    end
     for key, entry in pairs(toggles) do
         local enabled = entry.movement and engine.mode == key or not entry.movement and engine.enabled[key]
         if entry.last ~= enabled then
@@ -602,7 +688,10 @@ local function showWindow(visible)
     reopen.Visible = not visible
 end
 connect(minimize.Activated, function() showWindow(false) end)
-connect(reopen.Activated, function() showWindow(true) end)
+local reopenDragged = false
+connect(reopen.Activated, function()
+    if not reopenDragged then showWindow(true) end
+end)
 connect(Input.InputBegan, function(input, processed)
     if not processed and not Input:GetFocusedTextBox() and input.KeyCode == Enum.KeyCode.RightShift then
         showWindow(not window.Visible)
@@ -612,8 +701,9 @@ end)
 local viewSize = Vector2.new(900, 650)
 local windowSize = Vector2.new(850, 590)
 local placed = false
-local function clampPosition(position)
-    return Vector2.new(math.clamp(position.X, 8, math.max(8, viewSize.X - windowSize.X - 8)), math.clamp(position.Y, 8, math.max(8, viewSize.Y - windowSize.Y - 8)))
+local function clampPosition(position, size)
+    size = size or windowSize
+    return Vector2.new(math.clamp(position.X, 8, math.max(8, viewSize.X - size.X - 8)), math.clamp(position.Y, 8, math.max(8, viewSize.Y - size.Y - 8)))
 end
 local function layout()
     local camera = workspace.CurrentCamera
@@ -646,6 +736,8 @@ local function layout()
     local position = placed and Vector2.new(window.Position.X.Offset, window.Position.Y.Offset) or (viewSize - windowSize) / 2
     position = clampPosition(position)
     window.Position = UDim2.fromOffset(position.X, position.Y)
+    local minimizedPosition = clampPosition(Vector2.new(reopen.Position.X.Offset, reopen.Position.Y.Offset), Vector2.new(120, 42))
+    reopen.Position = UDim2.fromOffset(minimizedPosition.X, minimizedPosition.Y)
     placed = true
 end
 local cameraConnection
@@ -657,22 +749,39 @@ end
 connect(workspace:GetPropertyChangedSignal("CurrentCamera"), bindCamera)
 bindCamera()
 local drag
-connect(header.InputBegan, function(input)
+local function beginDrag(input, target)
     if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if drag then return end -- A second finger must not steal the active drag.
+    if target == reopen then reopenDragged = false end
+    drag = {
+        input = input, target = target,
+        start = Vector2.new(input.Position.X, input.Position.Y),
+        origin = Vector2.new(target.Position.X.Offset, target.Position.Y.Offset),
+    }
+end
+connect(header.InputBegan, function(input)
     -- Keep minimize/close clicks out of the drag region.
     if input.Position.X >= close.AbsolutePosition.X - 44 then return end
-    drag = { input = input, start = Vector2.new(input.Position.X, input.Position.Y), origin = Vector2.new(window.Position.X.Offset, window.Position.Y.Offset) }
+    beginDrag(input, window)
+end)
+connect(reopen.InputBegan, function(input)
+    beginDrag(input, reopen)
 end)
 connect(Input.InputChanged, function(input)
     if not drag then return end
     if drag.input.UserInputType == Enum.UserInputType.Touch then
         if input ~= drag.input then return end
     elseif input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
-    local position = clampPosition(drag.origin + Vector2.new(input.Position.X, input.Position.Y) - drag.start)
-    window.Position = UDim2.fromOffset(position.X, position.Y)
+    local delta = Vector2.new(input.Position.X, input.Position.Y) - drag.start
+    if delta.Magnitude < 6 and not drag.moved then return end
+    drag.moved = true
+    if drag.target == reopen then reopenDragged = true end
+    local size = drag.target == reopen and Vector2.new(120, 42) or windowSize
+    local position = clampPosition(drag.origin + delta, size)
+    drag.target.Position = UDim2.fromOffset(position.X, position.Y)
 end)
 connect(Input.InputEnded, function(input)
-    if drag and (input == drag.input or input.UserInputType == Enum.UserInputType.MouseButton1) then drag = nil end
+    if drag and input == drag.input then drag = nil end
 end)
 connect(player.Idled, function()
     if not engine.enabled.antiIdle then return end
@@ -688,7 +797,7 @@ end)
 connect(player.CharacterAdded, function()
     engine.farmPhase = "start"
     -- A respawn may cancel a job. Re-observe it instead of counting a stale collection.
-    engine.jobs = { phase = "idle", index = 1 }
+    engine.jobs = { phase = "idle" }
     engine.due.movement = 0
     log("Character respawned · reacquiring targets")
 end)

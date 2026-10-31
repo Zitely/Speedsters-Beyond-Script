@@ -2,14 +2,32 @@
 local Core = {}
 Core.__index = Core
 
--- These are the tier/slot pairs from the supplied script, not a live server reward table.
+-- Reward/eligibility data supplied from JobsConfig / JobRewards (2026-10-31).
 Core.JOBS = {
-    { tier = 4, slot = 1, name = "Extreme", reward = 40000 },
-    { tier = 10, slot = 2, name = "Ancient Crystal", reward = 25000 },
-    { tier = 7, slot = 1, name = "Long-Haul Cargo", reward = 18000 },
-    { tier = 3, slot = 1, name = "Hard", reward = 10000 },
-    { tier = 2, slot = 1, name = "Medium", reward = 5000 },
+    { tier = 4, jobType = 1, name = "Extreme", reward = 40000, ascensions = 75 },
+    { tier = 10, jobType = 2, name = "Ancient Crystal", reward = 25000, ascensions = 50 },
+    { tier = 7, jobType = 1, name = "Long-Haul Cargo", reward = 18000, ascensions = 30 },
+    { tier = 9, jobType = 2, name = "Crystal Core", reward = 14000, ascensions = 25 },
+    { tier = 3, jobType = 1, name = "Hard", reward = 10000, ascensions = 10 },
+    { tier = 6, jobType = 1, name = "City Express", reward = 10000, ascensions = 12 },
+    { tier = 8, jobType = 2, name = "Crystal Shards", reward = 6000, ascensions = 8 },
+    { tier = 2, jobType = 1, name = "Medium", reward = 5000, ascensions = 4 },
+    { tier = 5, jobType = 1, name = "Supply Rush", reward = 4000, ascensions = 3 },
+    { tier = 1, jobType = 1, name = "Easy", reward = 1000, ascensions = 0 },
 }
+
+function Core.bestJob(ascensions)
+    assert(type(ascensions) == "number" and ascensions >= 0 and ascensions < math.huge and ascensions % 1 == 0,
+        "Ascension count unavailable · enter your current count on Jobs")
+    local best
+    for _, candidate in ipairs(Core.JOBS) do
+        if ascensions >= candidate.ascensions and (not best or candidate.reward > best.reward
+            or candidate.reward == best.reward and candidate.ascensions < best.ascensions) then
+            best = candidate
+        end
+    end
+    return best
+end
 
 function Core.new(adapter)
     return setmetatable({
@@ -21,7 +39,7 @@ function Core.new(adapter)
         status = {},
         due = {},
         failures = {},
-        jobs = { phase = "idle", index = 1 },
+        jobs = { phase = "idle" },
         farmPhase = "start",
         deliveries = 0,
         orbRequests = 0,
@@ -43,7 +61,7 @@ function Core:setMode(mode)
     if not self.running or self.mode == mode then return end
     if self.mode then self:report(self.mode, "Off") end
     self.mode = mode
-    self.jobs = { phase = "idle", index = 1 }
+    self.jobs = { phase = "idle" }
     self.farmPhase = "start"
     self.due.movement = 0
     self.failures.movement = 0
@@ -87,66 +105,81 @@ end
 
 function Core:stepJobs(now)
     local job = self.jobs
-    -- nil means no job. An unavailable controller must throw, so we never claim blindly.
+    -- Keep ownership through arrival, payout and replicated destination flicker.
     local drop = self.adapter.getDropPoint()
-    if drop ~= nil then
-        if job.phase == "arrival" then
-            self.adapter.moveToDrop(drop)
-            self.adapter.reportArrival()
-            job.phase = "collect"
-            self:report("jobs", "Arrival reported · waiting to collect")
-            return 0.6
-        elseif job.phase == "collect" then
-            self.adapter.moveToDrop(drop)
-            self.adapter.collectJob()
-            job.phase = "confirm"
-            job.deadline = now + 3
-            self:report("jobs", "Collection requested · awaiting confirmation")
-            return 0.3
-        elseif job.phase == "confirm" and now < job.deadline then
-            return 0.3
+    if drop ~= nil then job.lastDrop = drop end
+
+    if job.phase == "arrival" then
+        -- The native arrival controller may already have cleared GetDropPoint.
+        self.adapter.moveToDrop(drop or job.lastDrop)
+        self.adapter.reportArrival()
+        job.phase = "collect"
+        self:report("jobs", "Arrival reported · waiting to collect banked payout")
+        return 0.8
+    elseif job.phase == "collect" then
+        -- A cleared destination must not skip CollectJob or send us back to the board.
+        if drop ~= nil then self.adapter.moveToDrop(drop) end
+        self.adapter.collectJob()
+        job.phase = "confirm"
+        job.deadline = now + 5
+        job.clearSince = nil
+        self:report("jobs", "Payout requested · confirming delivery cleared")
+        return 0.3
+    elseif job.phase == "confirm" then
+        if drop == nil then
+            job.clearSince = job.clearSince or now
+            if now - job.clearSince >= 3 then
+                self.deliveries = self.deliveries + 1
+                self.jobs = { phase = "idle" }
+                self:report("jobs", "Delivery cleared · next job in 2s")
+                return 2
+            end
+            self:report("jobs", "Confirming delivery cleared · staying at destination")
+        else
+            job.clearSince = nil
+            if now >= job.deadline then
+                job.retries = (job.retries or 0) + 1
+                if job.retries <= 2 then
+                    self.adapter.moveToDrop(drop)
+                    job.phase = "arrival"
+                    self:report("jobs", "Delivery still active · retrying arrival")
+                    return 0.8
+                end
+                self:report("jobs", "Delivery still active · holding position; restart Jobs to retry", true)
+                return 1
+            end
         end
+        return 0.3
+    end
+
+    if drop ~= nil then
         self.adapter.moveToDrop(drop)
         job.phase = "arrival"
         self:report("jobs", "Delivery active · approaching destination")
         return 0.8
     end
-
-    if job.phase == "confirm" then
-        self.deliveries = self.deliveries + 1
-        self.jobs = { phase = "idle", index = 1 }
-        self:report("jobs", "Delivery cleared · looking for the next job")
-        return 1.5
-    elseif job.phase == "arrival" or job.phase == "collect" then
-        -- A server cancellation is not a successful delivery.
-        self.jobs = { phase = "idle", index = 1 }
-        self:report("jobs", "Delivery ended before collection · checking the board")
-        return 1.5
-    end
-
     if job.phase == "waiting" then
-        if now < job.deadline then return 0.25 end
-        job.index = job.index + 1
-        job.phase = "idle"
-    end
-    if job.index > #Core.JOBS then
-        self.jobs = { phase = "idle", index = 1 }
-        self:report("jobs", "No listed job accepted · checking again in 8s")
-        return 8
+        if now >= job.deadline then
+            self:report("jobs", "Claim not confirmed · waiting; restart Jobs to retry", true)
+        end
+        -- A timeout is not a rejection. Never downgrade or send another claim blindly.
+        return 0.3
     end
 
-    local candidate = Core.JOBS[job.index]
-    self.adapter.moveToBoard()
+    local candidate = Core.bestJob(self.adapter.getAscensions())
     if job.phase ~= "claim" then
+        self.adapter.moveToBoard()
         job.phase = "claim"
-        self:report("jobs", "At job board · preparing " .. candidate.name)
+        self:report("jobs", "At board · selected " .. candidate.name .. " (" .. candidate.reward .. ")")
         return 0.8
     end
-    self.adapter.claimJob(candidate.tier, candidate.slot)
+    -- Recheck eligibility immediately before the request; ascension may have changed.
+    self.adapter.claimJob(candidate.tier, candidate.jobType)
+    job.choice = candidate
     job.phase = "waiting"
-    job.deadline = now + 5
+    job.deadline = now + 12
     self:report("jobs", "Requested " .. candidate.name .. " · waiting for acceptance")
-    return 0.25
+    return 0.3
 end
 
 function Core:tick(now)

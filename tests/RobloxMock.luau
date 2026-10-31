@@ -58,6 +58,13 @@ function Mock.new()
     function methods:IsA(class)
         return self.ClassName == class or class == "BasePart" and self.ClassName == "Part"
     end
+    function methods:GetAttribute(name)
+        return self._props.attributes and self._props.attributes[name]
+    end
+    function methods:SetAttribute(name, value)
+        self._props.attributes = self._props.attributes or {}
+        self._props.attributes[name] = value
+    end
     function methods:GetChildren() return table.clone(self._children) end
     function methods:GetDescendants()
         local result = {}
@@ -110,6 +117,7 @@ function Mock.new()
     workspace.CurrentCamera = instance("Camera")
     workspace.CurrentCamera.ViewportSize = v(1200, 800)
     local player = instance("Player")
+    player:SetAttribute("Ascensions", 10)
     local playerGui = instance("PlayerGui", "PlayerGui", player)
     player.Character = instance("Model")
     instance("Part", "HumanoidRootPart", player.Character)

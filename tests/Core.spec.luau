@@ -10,11 +10,12 @@ local function test(name, body)
 end
 local function fixture()
     local calls = {}
-    local state = { drop = nil }
+    local state = { drop = nil, ascensions = 10 }
     local adapter = {}
     for _, name in ipairs({ "moveToTreadmill", "chargeStart", "chargeBurst", "moveToBoard", "claimJob", "moveToDrop", "reportArrival", "collectJob", "resetRace", "ascend", "buyUpgrades" }) do
         adapter[name] = function(...) table.insert(calls, { name = name, args = { ... } }) end
     end
+    adapter.getAscensions = function() return state.ascensions end
     adapter.getDropPoint = function() return state.drop end
     adapter.collectNearestOrb = function() table.insert(calls, { name = "orb" }); return state.orb end
     local engine = Core.new(adapter)
@@ -71,30 +72,37 @@ test("job claim waits at the board then waits for server acceptance", function()
     equal(count("claimJob"), 0)
     e:tick(0.9)
     equal(count("claimJob"), 1)
-    equal(calls[#calls].args[1], 4)
+    equal(calls[#calls].args[1], 3)
     equal(calls[#calls].args[2], 1)
     for t = 1, 5, 0.25 do e:tick(t) end
     equal(count("claimJob"), 1)
     equal(count("collectJob"), 0)
 end)
-test("rejected tier falls back to the next supplied tier", function()
-    local e, _, calls, count = fixture()
-    e:setMode("jobs"); e:tick(0); e:tick(1); e:tick(6.1); e:tick(7)
-    equal(count("claimJob"), 2)
-    equal(calls[#calls].args[1], 10)
-    equal(calls[#calls].args[2], 2)
+test("a delayed claim never downgrades to Easy or sends another request", function()
+    local e, state, calls, count = fixture()
+    e:setMode("jobs"); e:tick(0); e:tick(1)
+    for t = 2, 60 do e:tick(t) end
+    equal(count("claimJob"), 1)
+    equal(calls[#calls].args[1], 3)
+    equal(calls[#calls].args[2], 1)
+    equal(count("moveToBoard"), 1)
+    state.drop = "late acceptance"
+    e:tick(61); e:tick(62); e:tick(63)
+    equal(count("collectJob"), 1)
 end)
 test("observed delivery prevents lower-tier claim bursts", function()
     local e, state, _, count = fixture()
     e:setMode("jobs"); e:tick(0); e:tick(1)
     state.drop = "destination"
-    e:tick(1.5); e:tick(2.4); e:tick(3.1)
+    e:tick(1.5); e:tick(2.5); e:tick(3.5)
     equal(count("claimJob"), 1)
     equal(count("reportArrival"), 1)
     equal(count("collectJob"), 1)
     equal(e.deliveries, 0)
     state.drop = nil
-    e:tick(3.5)
+    e:tick(4)
+    equal(e.deliveries, 0)
+    e:tick(7.1)
     equal(e.deliveries, 1)
 end)
 test("existing delivery is resumed without another claim", function()
@@ -104,13 +112,46 @@ test("existing delivery is resumed without another claim", function()
     equal(count("claimJob"), 0)
     equal(count("collectJob"), 1)
 end)
-test("canceled delivery is not counted as collected", function()
+test("stopping before arrival does not count canceled work", function()
     local e, state = fixture()
     state.drop = "destination"
     e:setMode("jobs"); e:tick(0)
     state.drop = nil
+    e:setMode(nil)
     e:tick(1)
     equal(e.deliveries, 0)
+end)
+test("native arrival can clear the destination before payout collection", function()
+    local e, state, _, count = fixture()
+    e:setMode("jobs"); e:tick(0); e:tick(1)
+    state.drop = "destination"
+    e:tick(2)
+    state.drop = nil -- Native controller reports arrival as soon as we enter its radius.
+    e:tick(3); e:tick(4); e:tick(5)
+    equal(count("moveToBoard"), 1)
+    equal(count("claimJob"), 1)
+    equal(count("reportArrival"), 1)
+    equal(count("collectJob"), 1)
+    equal(e.deliveries, 0)
+    e:tick(8.1)
+    equal(e.deliveries, 1)
+    equal(count("moveToBoard"), 1)
+end)
+test("completion needs consecutive clear readings and resets on a flicker", function()
+    local e, state, _, count = fixture()
+    state.drop = "destination"
+    e:setMode("jobs"); e:tick(0); e:tick(1); e:tick(2)
+    state.drop = nil
+    e:tick(3); e:tick(4)
+    state.drop = "destination"
+    e:tick(4.5)
+    state.drop = nil
+    e:tick(5); e:tick(7)
+    equal(e.deliveries, 0)
+    equal(count("moveToBoard"), 0)
+    e:tick(8.1)
+    equal(e.deliveries, 1)
+    equal(count("moveToBoard"), 0)
 end)
 test("collection is retried only after acknowledgement timeout", function()
     local e, state, _, count = fixture()
@@ -118,7 +159,7 @@ test("collection is retried only after acknowledgement timeout", function()
     e:setMode("jobs"); e:tick(0); e:tick(1); e:tick(2)
     for t = 2.5, 4.5, 0.5 do e:tick(t) end
     equal(count("collectJob"), 1)
-    e:tick(5.5); e:tick(6.5); e:tick(7.5)
+    e:tick(7.5); e:tick(8.5); e:tick(9.5)
     equal(count("collectJob"), 2)
 end)
 test("disabling a job during the arrival delay prevents collection", function()
@@ -129,16 +170,44 @@ test("disabling a job during the arrival delay prevents collection", function()
     equal(count("reportArrival"), 0)
     equal(count("collectJob"), 0)
 end)
-test("all rejected jobs incur a cooldown before the first tier retries", function()
-    local e, _, _, count = fixture()
+test("highest reward is selected from eligible jobs at every unlock boundary", function()
+    local cases = { {0, 1, 1}, {2, 1, 1}, {3, 5, 1}, {4, 2, 1}, {7, 2, 1},
+        {8, 8, 2}, {9, 8, 2}, {10, 3, 1}, {12, 3, 1}, {24, 3, 1}, {25, 9, 2},
+        {29, 9, 2}, {30, 7, 1}, {49, 7, 1}, {50, 10, 2}, {74, 10, 2}, {75, 4, 1} }
+    for _, case in ipairs(cases) do
+        local selected = Core.bestJob(case[1])
+        equal(selected.tier, case[2], "Tier at " .. case[1] .. " ascensions")
+        equal(selected.jobType, case[3])
+    end
+end)
+test("missing or invalid ascensions never silently claim Easy", function()
+    local e, state, _, count = fixture()
+    state.ascensions = nil
+    e:setMode("jobs"); e:tick(0); e:tick(10)
+    equal(count("claimJob"), 0)
+    equal(count("moveToBoard"), 0)
+    equal(e.status.jobs.problem, true)
+    for _, invalid in ipairs({ -1, 1.5, math.huge, 0/0, "10" }) do
+        equal(pcall(Core.bestJob, invalid), false)
+    end
+end)
+test("eligibility is rechecked before claiming after a stat change", function()
+    local e, state, calls = fixture()
+    state.ascensions = 0
+    e:setMode("jobs"); e:tick(0)
+    state.ascensions = 10
+    e:tick(1)
+    equal(calls[#calls].args[1], 3)
+end)
+test("stalled delivery retries are bounded and never return to the board", function()
+    local e, state, _, count = fixture()
+    state.drop = "destination"
     e:setMode("jobs")
-    for t = 0, 31, 0.25 do e:tick(t) end
-    equal(count("claimJob"), 5)
-    local before = count("claimJob")
-    for t = 31.25, 36, 0.25 do e:tick(t) end
-    equal(count("claimJob"), before)
-    for t = 36.25, 41, 0.25 do e:tick(t) end
-    equal(count("claimJob"), 6)
+    for t = 0, 60 do e:tick(t) end
+    equal(count("collectJob"), 3)
+    equal(count("moveToBoard"), 0)
+    equal(count("claimJob"), 0)
+    equal(e.status.jobs.problem, true)
 end)
 test("missing controller prevents blind job claims and recovers", function()
     local e, _, _, count, adapter = fixture()

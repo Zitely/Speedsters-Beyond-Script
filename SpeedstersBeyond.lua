@@ -4,14 +4,32 @@ local Core = (function()
 local Core = {}
 Core.__index = Core
 
--- These are the tier/slot pairs from the supplied script, not a live server reward table.
+-- Reward/eligibility data supplied from JobsConfig / JobRewards (2026-10-31).
 Core.JOBS = {
-    { tier = 4, slot = 1, name = "Extreme", reward = 40000 },
-    { tier = 10, slot = 2, name = "Ancient Crystal", reward = 25000 },
-    { tier = 7, slot = 1, name = "Long-Haul Cargo", reward = 18000 },
-    { tier = 3, slot = 1, name = "Hard", reward = 10000 },
-    { tier = 2, slot = 1, name = "Medium", reward = 5000 },
+    { tier = 4, jobType = 1, name = "Extreme", reward = 40000, ascensions = 75 },
+    { tier = 10, jobType = 2, name = "Ancient Crystal", reward = 25000, ascensions = 50 },
+    { tier = 7, jobType = 1, name = "Long-Haul Cargo", reward = 18000, ascensions = 30 },
+    { tier = 9, jobType = 2, name = "Crystal Core", reward = 14000, ascensions = 25 },
+    { tier = 3, jobType = 1, name = "Hard", reward = 10000, ascensions = 10 },
+    { tier = 6, jobType = 1, name = "City Express", reward = 10000, ascensions = 12 },
+    { tier = 8, jobType = 2, name = "Crystal Shards", reward = 6000, ascensions = 8 },
+    { tier = 2, jobType = 1, name = "Medium", reward = 5000, ascensions = 4 },
+    { tier = 5, jobType = 1, name = "Supply Rush", reward = 4000, ascensions = 3 },
+    { tier = 1, jobType = 1, name = "Easy", reward = 1000, ascensions = 0 },
 }
+
+function Core.bestJob(ascensions)
+    assert(type(ascensions) == "number" and ascensions >= 0 and ascensions < math.huge and ascensions % 1 == 0,
+        "Ascension count unavailable · enter your current count on Jobs")
+    local best
+    for _, candidate in ipairs(Core.JOBS) do
+        if ascensions >= candidate.ascensions and (not best or candidate.reward > best.reward
+            or candidate.reward == best.reward and candidate.ascensions < best.ascensions) then
+            best = candidate
+        end
+    end
+    return best
+end
 
 function Core.new(adapter)
     return setmetatable({
@@ -23,7 +41,7 @@ function Core.new(adapter)
         status = {},
         due = {},
         failures = {},
-        jobs = { phase = "idle", index = 1 },
+        jobs = { phase = "idle" },
         farmPhase = "start",
         deliveries = 0,
         orbRequests = 0,
@@ -45,7 +63,7 @@ function Core:setMode(mode)
     if not self.running or self.mode == mode then return end
     if self.mode then self:report(self.mode, "Off") end
     self.mode = mode
-    self.jobs = { phase = "idle", index = 1 }
+    self.jobs = { phase = "idle" }
     self.farmPhase = "start"
     self.due.movement = 0
     self.failures.movement = 0
@@ -89,66 +107,81 @@ end
 
 function Core:stepJobs(now)
     local job = self.jobs
-    -- nil means no job. An unavailable controller must throw, so we never claim blindly.
+    -- Keep ownership through arrival, payout and replicated destination flicker.
     local drop = self.adapter.getDropPoint()
-    if drop ~= nil then
-        if job.phase == "arrival" then
-            self.adapter.moveToDrop(drop)
-            self.adapter.reportArrival()
-            job.phase = "collect"
-            self:report("jobs", "Arrival reported · waiting to collect")
-            return 0.6
-        elseif job.phase == "collect" then
-            self.adapter.moveToDrop(drop)
-            self.adapter.collectJob()
-            job.phase = "confirm"
-            job.deadline = now + 3
-            self:report("jobs", "Collection requested · awaiting confirmation")
-            return 0.3
-        elseif job.phase == "confirm" and now < job.deadline then
-            return 0.3
+    if drop ~= nil then job.lastDrop = drop end
+
+    if job.phase == "arrival" then
+        -- The native arrival controller may already have cleared GetDropPoint.
+        self.adapter.moveToDrop(drop or job.lastDrop)
+        self.adapter.reportArrival()
+        job.phase = "collect"
+        self:report("jobs", "Arrival reported · waiting to collect banked payout")
+        return 0.8
+    elseif job.phase == "collect" then
+        -- A cleared destination must not skip CollectJob or send us back to the board.
+        if drop ~= nil then self.adapter.moveToDrop(drop) end
+        self.adapter.collectJob()
+        job.phase = "confirm"
+        job.deadline = now + 5
+        job.clearSince = nil
+        self:report("jobs", "Payout requested · confirming delivery cleared")
+        return 0.3
+    elseif job.phase == "confirm" then
+        if drop == nil then
+            job.clearSince = job.clearSince or now
+            if now - job.clearSince >= 3 then
+                self.deliveries = self.deliveries + 1
+                self.jobs = { phase = "idle" }
+                self:report("jobs", "Delivery cleared · next job in 2s")
+                return 2
+            end
+            self:report("jobs", "Confirming delivery cleared · staying at destination")
+        else
+            job.clearSince = nil
+            if now >= job.deadline then
+                job.retries = (job.retries or 0) + 1
+                if job.retries <= 2 then
+                    self.adapter.moveToDrop(drop)
+                    job.phase = "arrival"
+                    self:report("jobs", "Delivery still active · retrying arrival")
+                    return 0.8
+                end
+                self:report("jobs", "Delivery still active · holding position; restart Jobs to retry", true)
+                return 1
+            end
         end
+        return 0.3
+    end
+
+    if drop ~= nil then
         self.adapter.moveToDrop(drop)
         job.phase = "arrival"
         self:report("jobs", "Delivery active · approaching destination")
         return 0.8
     end
-
-    if job.phase == "confirm" then
-        self.deliveries = self.deliveries + 1
-        self.jobs = { phase = "idle", index = 1 }
-        self:report("jobs", "Delivery cleared · looking for the next job")
-        return 1.5
-    elseif job.phase == "arrival" or job.phase == "collect" then
-        -- A server cancellation is not a successful delivery.
-        self.jobs = { phase = "idle", index = 1 }
-        self:report("jobs", "Delivery ended before collection · checking the board")
-        return 1.5
-    end
-
     if job.phase == "waiting" then
-        if now < job.deadline then return 0.25 end
-        job.index = job.index + 1
-        job.phase = "idle"
-    end
-    if job.index > #Core.JOBS then
-        self.jobs = { phase = "idle", index = 1 }
-        self:report("jobs", "No listed job accepted · checking again in 8s")
-        return 8
+        if now >= job.deadline then
+            self:report("jobs", "Claim not confirmed · waiting; restart Jobs to retry", true)
+        end
+        -- A timeout is not a rejection. Never downgrade or send another claim blindly.
+        return 0.3
     end
 
-    local candidate = Core.JOBS[job.index]
-    self.adapter.moveToBoard()
+    local candidate = Core.bestJob(self.adapter.getAscensions())
     if job.phase ~= "claim" then
+        self.adapter.moveToBoard()
         job.phase = "claim"
-        self:report("jobs", "At job board · preparing " .. candidate.name)
+        self:report("jobs", "At board · selected " .. candidate.name .. " (" .. candidate.reward .. ")")
         return 0.8
     end
-    self.adapter.claimJob(candidate.tier, candidate.slot)
+    -- Recheck eligibility immediately before the request; ascension may have changed.
+    self.adapter.claimJob(candidate.tier, candidate.jobType)
+    job.choice = candidate
     job.phase = "waiting"
-    job.deadline = now + 5
+    job.deadline = now + 12
     self:report("jobs", "Requested " .. candidate.name .. " · waiting for acceptance")
-    return 0.25
+    return 0.3
 end
 
 function Core:tick(now)
@@ -415,6 +448,31 @@ local function jobsController()
     error(current.failure or "Loading JobsController", 0)
 end
 
+local ascensionOverride
+local function readAscensions()
+    if ascensionOverride ~= nil then return ascensionOverride, "manual" end
+    local detected
+    local function consider(value)
+        local number = tonumber(value)
+        if not number or number < 0 or number >= math.huge or number % 1 ~= 0 then return end
+        if detected ~= nil and detected ~= number then
+            error("Conflicting ascension counts · enter your current count below", 0)
+        end
+        detected = number
+    end
+    consider(player:GetAttribute("Ascensions"))
+    consider(player:GetAttribute("Ascension"))
+    -- Attribute and ValueObject paths differ across game versions. Never default a missing stat to 0.
+    for _, item in ipairs(player:GetDescendants()) do
+        local name = string.lower(item.Name)
+        if (name == "ascensions" or name == "ascension") and (item:IsA("IntValue") or item:IsA("NumberValue") or item:IsA("StringValue")) then
+            consider(item.Value)
+        end
+    end
+    if detected == nil then error("Ascensions unavailable · enter your current count below", 0) end
+    return detected, "detected"
+end
+
 local orbParts = {}
 local orbCooldown = setmetatable({}, { __mode = "k" })
 local orbsIndexed = false
@@ -445,6 +503,7 @@ engine = Core.new({
     end,
     chargeStart = function() send("ChargeStart") end,
     chargeBurst = function() send("ChargeBurst") end,
+    getAscensions = readAscensions,
     getDropPoint = function()
         root()
         local value = jobsController():GetDropPoint()
@@ -755,9 +814,57 @@ toggle(pages.Training, "orbs", "Nearby orb collection", "Collects the nearest de
 paragraph(pages.Training, "Treadmills refresh when you open the selector. Missing or streamed-out targets pause the action and show a retry status.", 94, 4)
 
 heading(pages.Jobs, "A SMOOTHER DELIVERY LOOP", "Jobs & delivery", "One request at a time. A delivery must appear before the controller heads to its destination.")
-toggle(pages.Jobs, "jobs", "Auto job & deliver", "Tries the supplied tiers in reward order and waits for acceptance.", 1, true)
-paragraph(pages.Jobs, "PRIORITY ORDER\nExtreme → Ancient Crystal → Long-Haul Cargo → Hard → Medium", 96, 2, palette.text)
-paragraph(pages.Jobs, "Rewards and tier IDs come from your original script. The server decides eligibility; this client has no live reward or ascension-requirement table.", 108, 3)
+toggle(pages.Jobs, "jobs", "Auto job & deliver", "Picks the highest-paying tier unlocked by your ascensions, then delivers and collects.", 1, true)
+local jobSelection = card(pages.Jobs, 224, 2)
+local jobSelectionTitle = label(jobSelection, "BEST ELIGIBLE JOB", 10, palette.muted, true)
+jobSelectionTitle.Position = UDim2.fromOffset(14, 10)
+jobSelectionTitle.Size = UDim2.new(1, -28, 0, 20)
+local jobPreview = label(jobSelection, "Checking ascensions…", 12, palette.accent)
+jobPreview.Position = UDim2.fromOffset(14, 34)
+jobPreview.Size = UDim2.new(1, -28, 0, 48)
+jobPreview.TextWrapped = true
+jobPreview.TextTruncate = Enum.TextTruncate.None
+local countInput = create("TextBox", {
+    Name = "AscensionCount", Text = "", PlaceholderText = "Current ascensions", ClearTextOnFocus = false,
+    Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = palette.text, PlaceholderColor3 = palette.muted,
+    BackgroundColor3 = palette.panel, BorderSizePixel = 0,
+    Position = UDim2.fromOffset(14, 92), Size = UDim2.new(1, -132, 0, 40),
+}, jobSelection)
+round(countInput, 8)
+local useCount = button(jobSelection, "Use count", palette.panel)
+useCount.Position = UDim2.new(1, -108, 0, 92)
+useCount.Size = UDim2.fromOffset(94, 40)
+local detectCount = button(jobSelection, "Use automatic detection", palette.panel)
+detectCount.Position = UDim2.fromOffset(14, 142)
+detectCount.Size = UDim2.new(1, -28, 0, 36)
+local countNote = label(jobSelection, "Manual count is optional. Keep it current if you use it.", 11, palette.muted)
+countNote.Position = UDim2.fromOffset(14, 184)
+countNote.Size = UDim2.new(1, -28, 0, 30)
+countNote.TextWrapped = true
+countNote.TextTruncate = Enum.TextTruncate.None
+local lastStatRefresh = -math.huge
+connect(useCount.Activated, function()
+    local value = tonumber(countInput.Text)
+    local valid = pcall(Core.bestJob, value)
+    if not valid then
+        jobPreview.Text = "Enter a whole ascension count of 0 or more."
+        jobPreview.TextColor3 = palette.warning
+        return
+    end
+    ascensionOverride = value
+    lastStatRefresh = -math.huge
+    engine.due.movement = 0
+    log("Manual ascension count set to " .. value)
+    refreshControls()
+end)
+connect(detectCount.Activated, function()
+    ascensionOverride = nil
+    countInput.Text = ""
+    lastStatRefresh = -math.huge
+    engine.due.movement = 0
+    refreshControls()
+end)
+paragraph(pages.Jobs, "At 10 ascensions, Hard pays 10,000. Locked tiers are skipped. If a claim is not confirmed, the hub waits instead of downgrading to Easy.", 108, 3)
 paragraph(pages.Jobs, "During deliveries, race reset and ascension wait so they cannot interrupt movement. Purchases can continue in the background.", 94, 4)
 
 heading(pages.Tools, "SET THE PACE", "Background tools", "Independent controls, spaced requests and clear feedback. Everything starts off except idle prevention.")
@@ -768,6 +875,18 @@ toggle(pages.Tools, "antiIdle", "Idle prevention", "Sends an idle input when sup
 paragraph(pages.Tools, "Minimize or Right Shift hides the panel while automation continues. Close unloads the hub. Stop all disables every toggle, including idle prevention.", 108, 5)
 
 refreshControls = function()
+    if os.clock() - lastStatRefresh >= 1 then
+        lastStatRefresh = os.clock()
+        local statOK, count, source = pcall(readAscensions)
+        if statOK then
+            local candidate = Core.bestJob(count)
+            jobPreview.Text = string.format("%d ascensions (%s)\n%s · %s reward", count, source, candidate.name, tostring(candidate.reward))
+            jobPreview.TextColor3 = palette.accent
+        else
+            jobPreview.Text = tostring(count)
+            jobPreview.TextColor3 = palette.warning
+        end
+    end
     for key, entry in pairs(toggles) do
         local enabled = entry.movement and engine.mode == key or not entry.movement and engine.enabled[key]
         if entry.last ~= enabled then
@@ -807,7 +926,10 @@ local function showWindow(visible)
     reopen.Visible = not visible
 end
 connect(minimize.Activated, function() showWindow(false) end)
-connect(reopen.Activated, function() showWindow(true) end)
+local reopenDragged = false
+connect(reopen.Activated, function()
+    if not reopenDragged then showWindow(true) end
+end)
 connect(Input.InputBegan, function(input, processed)
     if not processed and not Input:GetFocusedTextBox() and input.KeyCode == Enum.KeyCode.RightShift then
         showWindow(not window.Visible)
@@ -817,8 +939,9 @@ end)
 local viewSize = Vector2.new(900, 650)
 local windowSize = Vector2.new(850, 590)
 local placed = false
-local function clampPosition(position)
-    return Vector2.new(math.clamp(position.X, 8, math.max(8, viewSize.X - windowSize.X - 8)), math.clamp(position.Y, 8, math.max(8, viewSize.Y - windowSize.Y - 8)))
+local function clampPosition(position, size)
+    size = size or windowSize
+    return Vector2.new(math.clamp(position.X, 8, math.max(8, viewSize.X - size.X - 8)), math.clamp(position.Y, 8, math.max(8, viewSize.Y - size.Y - 8)))
 end
 local function layout()
     local camera = workspace.CurrentCamera
@@ -851,6 +974,8 @@ local function layout()
     local position = placed and Vector2.new(window.Position.X.Offset, window.Position.Y.Offset) or (viewSize - windowSize) / 2
     position = clampPosition(position)
     window.Position = UDim2.fromOffset(position.X, position.Y)
+    local minimizedPosition = clampPosition(Vector2.new(reopen.Position.X.Offset, reopen.Position.Y.Offset), Vector2.new(120, 42))
+    reopen.Position = UDim2.fromOffset(minimizedPosition.X, minimizedPosition.Y)
     placed = true
 end
 local cameraConnection
@@ -862,22 +987,39 @@ end
 connect(workspace:GetPropertyChangedSignal("CurrentCamera"), bindCamera)
 bindCamera()
 local drag
-connect(header.InputBegan, function(input)
+local function beginDrag(input, target)
     if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if drag then return end -- A second finger must not steal the active drag.
+    if target == reopen then reopenDragged = false end
+    drag = {
+        input = input, target = target,
+        start = Vector2.new(input.Position.X, input.Position.Y),
+        origin = Vector2.new(target.Position.X.Offset, target.Position.Y.Offset),
+    }
+end
+connect(header.InputBegan, function(input)
     -- Keep minimize/close clicks out of the drag region.
     if input.Position.X >= close.AbsolutePosition.X - 44 then return end
-    drag = { input = input, start = Vector2.new(input.Position.X, input.Position.Y), origin = Vector2.new(window.Position.X.Offset, window.Position.Y.Offset) }
+    beginDrag(input, window)
+end)
+connect(reopen.InputBegan, function(input)
+    beginDrag(input, reopen)
 end)
 connect(Input.InputChanged, function(input)
     if not drag then return end
     if drag.input.UserInputType == Enum.UserInputType.Touch then
         if input ~= drag.input then return end
     elseif input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
-    local position = clampPosition(drag.origin + Vector2.new(input.Position.X, input.Position.Y) - drag.start)
-    window.Position = UDim2.fromOffset(position.X, position.Y)
+    local delta = Vector2.new(input.Position.X, input.Position.Y) - drag.start
+    if delta.Magnitude < 6 and not drag.moved then return end
+    drag.moved = true
+    if drag.target == reopen then reopenDragged = true end
+    local size = drag.target == reopen and Vector2.new(120, 42) or windowSize
+    local position = clampPosition(drag.origin + delta, size)
+    drag.target.Position = UDim2.fromOffset(position.X, position.Y)
 end)
 connect(Input.InputEnded, function(input)
-    if drag and (input == drag.input or input.UserInputType == Enum.UserInputType.MouseButton1) then drag = nil end
+    if drag and input == drag.input then drag = nil end
 end)
 connect(player.Idled, function()
     if not engine.enabled.antiIdle then return end
@@ -893,7 +1035,7 @@ end)
 connect(player.CharacterAdded, function()
     engine.farmPhase = "start"
     -- A respawn may cancel a job. Re-observe it instead of counting a stale collection.
-    engine.jobs = { phase = "idle", index = 1 }
+    engine.jobs = { phase = "idle" }
     engine.due.movement = 0
     log("Character respawned · reacquiring targets")
 end)

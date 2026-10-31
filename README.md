@@ -39,17 +39,34 @@ To run before publishing, copy the full `SpeedstersBeyond.lua` file into your cl
 A dark, mint-accented control center with desktop sidebar navigation, compact mobile tabs, touch dragging, live feature status, and a session activity feed. No external UI libraries or asset downloads.
 
 - **Training:** choose a discovered treadmill; charge and burst are spaced. Nearby orb collection selects the closest detected orb within 80 studs and avoids immediately retrying the same object.
-- **Jobs:** attempts the supplied job tiers in descending listed reward order, waits for a delivery to appear, then separates travel, arrival, collection, and confirmation. It resumes an existing delivery when enabled.
+- **Jobs:** selects the highest-reward tier unlocked by your ascensions, waits for acceptance, then separates travel, arrival, banked payout collection, and confirmation. Existing deliveries resume without another claim. A missing destination after arrival no longer skips collection or immediately returns you to the board.
 - **Tools:** repeat race reset, auto ascend, Speed / Jump purchases, and idle prevention.
 - **Reliability:** one movement mode at a time; missing characters, remotes, and targets show retry messages with backoff. Respawns reacquire targets. Reloading replaces the previous session and closes its connections.
 
-Use **Right Shift** or **−** to hide the panel; the floating **SB / Open** button restores it. Automation continues while hidden. **Stop all** disables every toggle, including idle prevention. **×** unloads the UI and its automation. Movement, purchasing, race resets, and ascension start off; idle prevention starts on.
+Use **Right Shift** or **−** to hide the panel; the floating **SB / Open** button restores it. Drag that minimized button with mouse or touch to reposition it; releasing a drag keeps the panel minimized. Its position is clamped to the screen, including after rotation. Automation continues while hidden. **Stop all** disables every toggle, including idle prevention. **×** unloads the UI and its automation. Movement, purchasing, race resets, and ascension start off; idle prevention starts on.
 
 ## Behavior and limits
 
-The server's implementation was not included with the supplied script. The adapter retains its existing remote names and arguments; requests are not proof that the server accepted an action.
+Selection uses the following reward and eligibility details supplied from the game's `JobsConfig` and `JobRewards`. Equal rewards prefer the tier with the lower ascension requirement (Hard over City Express). This is a supplied configuration snapshot, not live server introspection.
 
-Job priority uses the original tier/slot pairs: Extreme `(4, 1)`, Ancient Crystal `(10, 2)`, Long-Haul Cargo `(7, 1)`, Hard `(3, 1)`, and Medium `(2, 1)`. There is no verified live rewards or eligibility API, so the hub waits five seconds for each claim before trying the next. It cannot guarantee the best-paying eligible job. The delivery counter records a destination disappearing after a collection request, not verified payment.
+| Job | Tier | Type | Reward | Ascensions required |
+| --- | ---: | ---: | ---: | ---: |
+| Extreme | 4 | 1 | 40,000 | 75 |
+| Ancient Crystal | 10 | 2 | 25,000 | 50 |
+| Long-Haul Cargo | 7 | 1 | 18,000 | 30 |
+| Crystal Core | 9 | 2 | 14,000 | 25 |
+| Hard | 3 | 1 | 10,000 | 10 |
+| City Express | 6 | 1 | 10,000 | 12 |
+| Crystal Shards | 8 | 2 | 6,000 | 8 |
+| Medium | 2 | 1 | 5,000 | 4 |
+| Supply Rush | 5 | 1 | 4,000 | 3 |
+| Easy | 1 | 1 | 1,000 | 0 |
+
+The Jobs page shows the ascension count and selected tier. Automatic detection reads player attributes or numeric stat ValueObjects named `Ascensions` / `Ascension`. Unknown or conflicting counts pause claims instead of assuming zero and choosing Easy. If your version of the game stores this elsewhere, enter your actual count and press **Use count**; **Use automatic detection** clears that override. Keep manual counts current. Overrides reset when the hub reloads.
+
+Only one claim is sent. If acceptance is not observed within 12 seconds, the controller keeps waiting and never silently downgrades; toggle Auto Jobs off/on to retry. During delivery, the destination is retained through arrival so native arrival handling can clear it without skipping payout collection. After collection, the destination must remain absent for three seconds before returning to the board. Arrival/collection retries are limited to two extra attempts if the destination remains active.
+
+Requests are not proof of server acceptance or payment. The delivery counter records a stable cleared destination after a collection request. Game updates may change the configuration or remote behavior; live in-game validation is still required.
 
 Race reset and ascension pause while jobs control movement. **Repeat race reset** only calls `ResetRace`; it does not finish a race. **Auto buy upgrades** requests both Speed and Jump purchases and can spend available currency. Orb detection uses BasePart names containing `orb`, matching the supplied script's convention. Streaming and game updates may change what is available. Idle input depends on runtime support.
 
