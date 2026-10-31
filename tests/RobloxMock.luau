@@ -1,7 +1,7 @@
 -- A deliberately small Roblox API double for wiring/lifecycle tests, not a game simulator.
 local Mock = {}
 function Mock.new()
-    local mock = { shared = {}, clock = 0, calls = {}, connections = {}, warnings = {} }
+    local mock = { shared = {}, clock = 0, calls = {}, connections = {}, warnings = {}, walks = {} }
     local function signal()
         local result = { listeners = {} }
         function result:Connect(callback)
@@ -105,7 +105,13 @@ function Mock.new()
     end
     function methods:Fire(...) self.Event:Fire(...) end
     function methods:FireServer(...)
-        table.insert(mock.calls, { name = self.Name, args = { ... } })
+        local args = { ... }
+        table.insert(mock.calls, { name = self.Name, args = args, time = mock.clock })
+        if mock.onRemote then mock.onRemote(self.Name, args) end
+    end
+    function methods:MoveTo(position)
+        self.WalkToPoint = position
+        table.insert(mock.walks, { humanoid = self, position = position, time = mock.clock })
     end
     function methods:GetPivot() return self:FindFirstChildWhichIsA("BasePart", true).CFrame end
     local function instance(class, name, parent)

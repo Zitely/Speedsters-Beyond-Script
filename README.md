@@ -64,7 +64,13 @@ Selection uses the following reward and eligibility details supplied from the ga
 
 The Jobs page shows the ascension count and selected tier. Automatic detection reads player attributes or numeric stat ValueObjects named `Ascensions` / `Ascension`. Unknown or conflicting counts pause claims instead of assuming zero and choosing Easy. If your version of the game stores this elsewhere, enter your actual count and press **Use count**; **Use automatic detection** clears that override. Keep manual counts current. Overrides reset when the hub reloads.
 
-Only one claim is sent. If acceptance is not observed within 12 seconds, the controller keeps waiting and never silently downgrades; toggle Auto Jobs off/on to retry. During delivery, the destination is retained through arrival so native arrival handling can clear it without skipping payout collection. After collection, the destination must remain absent for three seconds before returning to the board. Arrival/collection retries are limited to two extra attempts if the destination remains active.
+Only one claim is sent. If acceptance is not observed within 12 seconds, the controller keeps waiting and never silently downgrades; toggle Auto Jobs off/on to retry.
+
+For deliveries, the character repositions near the destination, then uses normal Humanoid walking for the final few studs. Arrival reports wait until the character has been observed within the supplied 50-stud arrival radius for 1.5 seconds. Normal movement within that radius does not cause another teleport. If the character is pushed outside the radius, the settle timer restarts and correction attempts are limited to three. Stopping Jobs cancels its pending walk.
+
+Arrival reports are spaced three seconds apart, up to five attempts. The status shows the measured **client-side** distance and attempt count. The only completion observation supplied to this adapter is `GetDropPoint`; it must stay cleared for 1.5 seconds after an arrival report before a payout request is sent. A native completion can clear it before the report; the last destination is retained for that case. If your game version retains the destination until collection, its actual arrival/payout state API is needed to support that protocol.
+
+An unconfirmed arrival holds the current delivery and shows its distance rather than collecting early or starting another job. After a payout request, the destination must remain absent for three more seconds before returning to the board. If the destination reappears during payout confirmation, the hub returns to waiting for arrival and limits payout requests to three.
 
 Requests are not proof of server acceptance or payment. The delivery counter records a stable cleared destination after a collection request. Game updates may change the configuration or remote behavior; live in-game validation is still required.
 

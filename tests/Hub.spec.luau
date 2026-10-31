@@ -10,6 +10,9 @@ local function activeConnections(mock)
     for _, connection in ipairs(mock.connections) do if connection.Connected then count = count + 1 end end
     return count
 end
+local function advance(mock, first, last)
+    for time = first, last, 0.5 do mock.tick(time) end
+end
 
 test("bundle creates four pages and responsive desktop/mobile navigation", function()
     local m = Mock.new()
@@ -107,11 +110,12 @@ test("job adapter loads controller, claims once, arrives then collects", functio
     m.toggle("Auto job & deliver"); m.tick(0); m.tick(1)
     assert(#m.calls == 1 and m.calls[1].name == "ClaimJob")
     m.drop = m.vector(100, 0, 0)
-    m.tick(2); m.tick(3); m.tick(4)
-    assert(m.calls[2].name == "ReportJobArrival" and m.calls[3].name == "CollectJob")
+    advance(m, 2, 4)
+    assert(#m.calls == 2 and m.calls[2].name == "ReportJobArrival")
     m.drop = nil
-    m.tick(5); assert(s.engine.deliveries == 0)
-    m.tick(8.1); assert(s.engine.deliveries == 1)
+    advance(m, 4.5, 6.5)
+    assert(m.calls[3].name == "CollectJob" and s.engine.deliveries == 0)
+    advance(m, 7, 10); assert(s.engine.deliveries == 1)
     s.destroy()
 end)
 test("orbs use distance, cooldowns, and streamed additions/removals", function()
@@ -257,11 +261,62 @@ test("destination clearing on native arrival still collects without returning to
     m.drop = m.vector(100, 0, 0)
     m.tick(2)
     m.drop = nil
-    m.tick(3); m.tick(4); m.tick(5)
+    advance(m, 3, 7)
     local position = m.player.Character:FindFirstChild("HumanoidRootPart").Position
     assert(position.X == 100, "Character went back to the board before collection settled")
     assert(#m.calls == 3 and m.calls[3].name == "CollectJob")
-    m.tick(8.1); assert(s.engine.deliveries == 1)
+    advance(m, 7.5, 10.5); assert(s.engine.deliveries == 1)
+    s.destroy()
+end)
+test("late server arrival acceptance gates collection", function()
+    local m = Mock.new()
+    local s = m.load(BUNDLE)
+    m.drop = m.vector(100, 0, 0)
+    local acceptedAt
+    m.onRemote = function(name)
+        if name == "ReportJobArrival" and m.clock >= 6 then
+            acceptedAt = m.clock
+            m.drop = nil
+        elseif name == "CollectJob" then
+            assert(acceptedAt and m.clock - acceptedAt >= 1.5, "Payout requested before arrival was accepted")
+        end
+    end
+    m.toggle("Auto job & deliver")
+    advance(m, 0, 14)
+    assert(acceptedAt == 8)
+    assert(s.engine.deliveries == 1)
+    assert(m.calls[1].time == 2 and m.calls[1].name == "ReportJobArrival")
+    assert(m.calls[4].name == "CollectJob")
+    s.destroy()
+end)
+test("nearby character movement does not cause repeated teleports and stop cancels walking", function()
+    local m = Mock.new()
+    local s = m.load(BUNDLE)
+    m.drop = m.vector(100, 0, 0)
+    m.toggle("Auto job & deliver"); m.tick(0)
+    local root = m.player.Character:FindFirstChild("HumanoidRootPart")
+    assert(root.Position.X == 100 and root.Position.Z == 10)
+    assert(#m.walks == 1 and m.walks[1].position.X == 100 and m.walks[1].position.Z == 0)
+    root.CFrame = m.environment.CFrame.new(m.vector(100, 3, 20))
+    advance(m, 0.5, 5)
+    assert(root.Position.Z == 20 and #m.walks == 1, "Repeated movement reset the approach")
+    m.toggle("Auto job & deliver")
+    assert(#m.walks == 2 and m.walks[2].position.Z == 20)
+    local before = #m.calls
+    m.tick(100)
+    assert(#m.calls == before)
+    s.destroy()
+end)
+test("a replicated position correction delays arrival until the new position settles", function()
+    local m = Mock.new()
+    local s = m.load(BUNDLE)
+    m.drop = m.vector(100, 0, 0)
+    m.toggle("Auto job & deliver"); m.tick(0)
+    m.player.Character:FindFirstChild("HumanoidRootPart").CFrame = m.environment.CFrame.new(m.vector(0, 0, 0))
+    advance(m, 0.5, 4.5)
+    assert(#m.calls == 0)
+    m.tick(5)
+    assert(m.calls[1].name == "ReportJobArrival")
     s.destroy()
 end)
 print(string.format("%d UI/adapter tests passed (mock Roblox API)", passed))

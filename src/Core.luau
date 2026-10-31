@@ -1,6 +1,11 @@
 -- Pure automation controller. Adapter calls must not yield; Roblox lookups live in Hub.luau.
 local Core = {}
 Core.__index = Core
+Core.ARRIVAL_RADIUS = 50
+Core.ARRIVAL_SETTLE = 1.5
+Core.ARRIVAL_CLEAR = 1.5
+Core.ARRIVAL_RETRY = 3
+Core.ARRIVAL_ATTEMPTS = 5
 
 -- Reward/eligibility data supplied from JobsConfig / JobRewards (2026-10-31).
 Core.JOBS = {
@@ -59,6 +64,9 @@ end
 function Core:setMode(mode)
     assert(mode == nil or mode == "farm" or mode == "orbs" or mode == "jobs", "Unknown movement mode")
     if not self.running or self.mode == mode then return end
+    if self.mode == "jobs" and self.adapter.stopDeliveryMovement then
+        self.adapter.stopDeliveryMovement()
+    end
     if self.mode then self:report(self.mode, "Off") end
     self.mode = mode
     self.jobs = { phase = "idle" }
@@ -95,6 +103,12 @@ function Core:run(key, statusKey, now, callback)
         self.failures[key] = 0
         self.due[key] = now + (delay or 1)
     else
+        if statusKey == "jobs" then
+            -- An unreadable sample is not evidence of continuous proximity/completion.
+            self.jobs.withinSince = nil
+            self.jobs.arrivalClearSince = nil
+            self.jobs.clearSince = nil
+        end
         local failures = (self.failures[key] or 0) + 1
         self.failures[key] = failures
         local retry = math.min(15, 2 ^ math.min(failures - 1, 4))
@@ -105,23 +119,73 @@ end
 
 function Core:stepJobs(now)
     local job = self.jobs
-    -- Keep ownership through arrival, payout and replicated destination flicker.
     local drop = self.adapter.getDropPoint()
     if drop ~= nil then job.lastDrop = drop end
 
-    if job.phase == "arrival" then
-        -- The native arrival controller may already have cleared GetDropPoint.
-        self.adapter.moveToDrop(drop or job.lastDrop)
-        self.adapter.reportArrival()
-        job.phase = "collect"
-        self:report("jobs", "Arrival reported · waiting to collect banked payout")
-        return 0.8
+    if job.phase == "approach" or job.phase == "awaitArrival" then
+        -- A game-side completion can move the player too. Once arrival was reported,
+        -- observe a cleared destination before considering any position corrections.
+        if job.phase == "awaitArrival" and drop == nil then
+            job.arrivalClearSince = job.arrivalClearSince or now
+            if now - job.arrivalClearSince >= Core.ARRIVAL_CLEAR then
+                job.phase = "collect"
+                self:report("jobs", "Destination cleared · ready to collect banked payout")
+            else
+                self:report("jobs", "Destination cleared · checking it stays cleared")
+            end
+            return 0.3
+        end
+        job.arrivalClearSince = nil
+        local distance = self.adapter.getDropDistance(job.lastDrop)
+        assert(type(distance) == "number" and distance >= 0 and distance < math.huge, "Delivery distance unavailable")
+        local attempts = job.arrivalAttempts or 0
+        local detail = string.format("%.1f / %d studs · arrival %d/%d", distance, Core.ARRIVAL_RADIUS, attempts, Core.ARRIVAL_ATTEMPTS)
+
+        if distance > Core.ARRIVAL_RADIUS then
+            job.withinSince = nil
+            job.arrivalClearSince = nil
+            if (job.repositions or 0) < 3 and now >= (job.nextReposition or 0) then
+                self.adapter.moveToDrop(job.lastDrop)
+                job.repositions = (job.repositions or 0) + 1
+                job.nextReposition = now + 3
+            end
+            self:report("jobs", "Outside delivery radius · " .. detail, true)
+            return 0.3
+        end
+        job.withinSince = job.withinSince or now
+        if now - job.withinSince < Core.ARRIVAL_SETTLE then
+            self:report("jobs", "Letting position settle · " .. detail)
+            return 0.3
+        end
+
+        if attempts >= Core.ARRIVAL_ATTEMPTS then
+            self:report("jobs", "Arrival unconfirmed · " .. detail .. " · try walking to marker", true)
+            return 0.5
+        end
+        if now >= (job.nextArrival or 0) then
+            self.adapter.reportArrival()
+            job.arrivalAttempts = attempts + 1
+            job.nextArrival = now + Core.ARRIVAL_RETRY
+            job.phase = "awaitArrival"
+            self:report("jobs", string.format("Arrival sent · %.1f / %d studs · attempt %d/%d; awaiting game", distance, Core.ARRIVAL_RADIUS, job.arrivalAttempts, Core.ARRIVAL_ATTEMPTS))
+        else
+            self:report("jobs", "Awaiting arrival · " .. detail)
+        end
+        return 0.3
     elseif job.phase == "collect" then
-        -- A cleared destination must not skip CollectJob or send us back to the board.
-        if drop ~= nil then self.adapter.moveToDrop(drop) end
+        if drop ~= nil then
+            job.phase = "awaitArrival"
+            job.arrivalClearSince = nil
+            self:report("jobs", "Destination active again · waiting for arrival acceptance")
+            return 0.3
+        end
+        if (job.collections or 0) >= 3 then
+            self:report("jobs", "Payout state keeps changing · holding delivery; restart Jobs to retry", true)
+            return 1
+        end
         self.adapter.collectJob()
+        job.collections = (job.collections or 0) + 1
         job.phase = "confirm"
-        job.deadline = now + 5
         job.clearSince = nil
         self:report("jobs", "Payout requested · confirming delivery cleared")
         return 0.3
@@ -129,6 +193,7 @@ function Core:stepJobs(now)
         if drop == nil then
             job.clearSince = job.clearSince or now
             if now - job.clearSince >= 3 then
+                self.adapter.stopDeliveryMovement()
                 self.deliveries = self.deliveries + 1
                 self.jobs = { phase = "idle" }
                 self:report("jobs", "Delivery cleared · next job in 2s")
@@ -137,26 +202,19 @@ function Core:stepJobs(now)
             self:report("jobs", "Confirming delivery cleared · staying at destination")
         else
             job.clearSince = nil
-            if now >= job.deadline then
-                job.retries = (job.retries or 0) + 1
-                if job.retries <= 2 then
-                    self.adapter.moveToDrop(drop)
-                    job.phase = "arrival"
-                    self:report("jobs", "Delivery still active · retrying arrival")
-                    return 0.8
-                end
-                self:report("jobs", "Delivery still active · holding position; restart Jobs to retry", true)
-                return 1
-            end
+            job.arrivalClearSince = nil
+            job.phase = "awaitArrival"
+            self:report("jobs", "Destination active again · holding this delivery")
         end
         return 0.3
     end
 
     if drop ~= nil then
         self.adapter.moveToDrop(drop)
-        job.phase = "arrival"
-        self:report("jobs", "Delivery active · approaching destination")
-        return 0.8
+        job.phase = "approach"
+        job.nextReposition = now + 3
+        self:report("jobs", "Approaching delivery · waiting for position to settle")
+        return 0.3
     end
     if job.phase == "waiting" then
         if now >= job.deadline then

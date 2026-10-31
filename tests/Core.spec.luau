@@ -10,11 +10,12 @@ local function test(name, body)
 end
 local function fixture()
     local calls = {}
-    local state = { drop = nil, ascensions = 10 }
+    local state = { drop = nil, ascensions = 10, distance = 3 }
     local adapter = {}
-    for _, name in ipairs({ "moveToTreadmill", "chargeStart", "chargeBurst", "moveToBoard", "claimJob", "moveToDrop", "reportArrival", "collectJob", "resetRace", "ascend", "buyUpgrades" }) do
+    for _, name in ipairs({ "moveToTreadmill", "chargeStart", "chargeBurst", "moveToBoard", "claimJob", "moveToDrop", "reportArrival", "collectJob", "stopDeliveryMovement", "resetRace", "ascend", "buyUpgrades" }) do
         adapter[name] = function(...) table.insert(calls, { name = name, args = { ... } }) end
     end
+    adapter.getDropDistance = function() return state.distance end
     adapter.getAscensions = function() return state.ascensions end
     adapter.getDropPoint = function() return state.drop end
     adapter.collectNearestOrb = function() table.insert(calls, { name = "orb" }); return state.orb end
@@ -25,6 +26,10 @@ local function fixture()
         return total
     end
     return engine, state, calls, count, adapter
+end
+
+local function advance(engine, first, last)
+    for time = first, last, 0.5 do engine:tick(time) end
 end
 
 test("defaults produce no remote requests", function()
@@ -81,94 +86,146 @@ end)
 test("a delayed claim never downgrades to Easy or sends another request", function()
     local e, state, calls, count = fixture()
     e:setMode("jobs"); e:tick(0); e:tick(1)
-    for t = 2, 60 do e:tick(t) end
+    advance(e, 2, 60)
     equal(count("claimJob"), 1)
     equal(calls[#calls].args[1], 3)
-    equal(calls[#calls].args[2], 1)
     equal(count("moveToBoard"), 1)
     state.drop = "late acceptance"
-    e:tick(61); e:tick(62); e:tick(63)
+    advance(e, 61, 64)
+    equal(count("reportArrival"), 1)
+    equal(count("collectJob"), 0)
+    state.drop = nil
+    advance(e, 65, 68)
     equal(count("collectJob"), 1)
 end)
-test("observed delivery prevents lower-tier claim bursts", function()
+test("an observed delivery keeps its claim while arrival acceptance is pending", function()
     local e, state, _, count = fixture()
     e:setMode("jobs"); e:tick(0); e:tick(1)
     state.drop = "destination"
-    e:tick(1.5); e:tick(2.5); e:tick(3.5)
+    advance(e, 2, 5)
     equal(count("claimJob"), 1)
     equal(count("reportArrival"), 1)
+    equal(count("collectJob"), 0)
+    state.drop = nil
+    advance(e, 5.5, 7.5)
     equal(count("collectJob"), 1)
     equal(e.deliveries, 0)
-    state.drop = nil
-    e:tick(4)
-    equal(e.deliveries, 0)
-    e:tick(7.1)
+    advance(e, 8, 11)
     equal(e.deliveries, 1)
 end)
-test("existing delivery is resumed without another claim", function()
+test("existing delivery resumes without another claim", function()
     local e, state, _, count = fixture()
     state.drop = "destination"
-    e:setMode("jobs"); e:tick(0); e:tick(1); e:tick(2)
+    e:setMode("jobs"); advance(e, 0, 3)
     equal(count("claimJob"), 0)
+    equal(count("collectJob"), 0)
+    state.drop = nil
+    advance(e, 3.5, 5.5)
     equal(count("collectJob"), 1)
 end)
-test("stopping before arrival does not count canceled work", function()
-    local e, state = fixture()
-    state.drop = "destination"
-    e:setMode("jobs"); e:tick(0)
-    state.drop = nil
-    e:setMode(nil)
-    e:tick(1)
-    equal(e.deliveries, 0)
-end)
-test("native arrival can clear the destination before payout collection", function()
-    local e, state, _, count = fixture()
-    e:setMode("jobs"); e:tick(0); e:tick(1)
-    state.drop = "destination"
-    e:tick(2)
-    state.drop = nil -- Native controller reports arrival as soon as we enter its radius.
-    e:tick(3); e:tick(4); e:tick(5)
-    equal(count("moveToBoard"), 1)
-    equal(count("claimJob"), 1)
-    equal(count("reportArrival"), 1)
-    equal(count("collectJob"), 1)
-    equal(e.deliveries, 0)
-    e:tick(8.1)
-    equal(e.deliveries, 1)
-    equal(count("moveToBoard"), 1)
-end)
-test("completion needs consecutive clear readings and resets on a flicker", function()
-    local e, state, _, count = fixture()
-    state.drop = "destination"
-    e:setMode("jobs"); e:tick(0); e:tick(1); e:tick(2)
-    state.drop = nil
-    e:tick(3); e:tick(4)
-    state.drop = "destination"
-    e:tick(4.5)
-    state.drop = nil
-    e:tick(5); e:tick(7)
-    equal(e.deliveries, 0)
-    equal(count("moveToBoard"), 0)
-    e:tick(8.1)
-    equal(e.deliveries, 1)
-    equal(count("moveToBoard"), 0)
-end)
-test("collection is retried only after acknowledgement timeout", function()
-    local e, state, _, count = fixture()
-    state.drop = "destination"
-    e:setMode("jobs"); e:tick(0); e:tick(1); e:tick(2)
-    for t = 2.5, 4.5, 0.5 do e:tick(t) end
-    equal(count("collectJob"), 1)
-    e:tick(7.5); e:tick(8.5); e:tick(9.5)
-    equal(count("collectJob"), 2)
-end)
-test("disabling a job during the arrival delay prevents collection", function()
+test("stopping before arrival cancels movement and does not collect", function()
     local e, state, _, count = fixture()
     state.drop = "destination"
     e:setMode("jobs"); e:tick(0)
-    e:setMode(nil); e:tick(10)
+    e:setMode(nil); advance(e, 1, 10)
+    equal(count("stopDeliveryMovement"), 1)
     equal(count("reportArrival"), 0)
     equal(count("collectJob"), 0)
+    equal(e.deliveries, 0)
+end)
+test("native arrival can clear the destination before our arrival report", function()
+    local e, state, _, count = fixture()
+    state.drop = "destination"
+    e:setMode("jobs"); e:tick(0)
+    state.drop = nil
+    advance(e, 0.5, 4.5)
+    equal(count("reportArrival"), 1)
+    equal(count("collectJob"), 1)
+    equal(count("moveToBoard"), 0)
+    equal(e.deliveries, 0)
+    advance(e, 5, 8)
+    equal(e.deliveries, 1)
+end)
+test("arrival and payout confirmation both reject transient destination flicker", function()
+    local e, state, _, count = fixture()
+    state.drop = "destination"
+    e:setMode("jobs"); advance(e, 0, 2)
+    state.drop = nil
+    advance(e, 2.5, 3)
+    state.drop = "destination"; e:tick(3.5)
+    state.drop = nil
+    advance(e, 4, 5)
+    equal(count("collectJob"), 0)
+    advance(e, 5.5, 6)
+    equal(count("collectJob"), 1)
+    state.drop = "destination"; e:tick(6.5)
+    state.drop = nil
+    advance(e, 7, 9)
+    equal(e.deliveries, 0)
+    equal(count("moveToBoard"), 0)
+    advance(e, 9.5, 12.5)
+    equal(e.deliveries, 1)
+end)
+test("arrival retries are spaced and never collect an unaccepted delivery", function()
+    local e, state, calls, count = fixture()
+    state.drop = "destination"
+    e:setMode("jobs")
+    local reportTimes = {}
+    for time = 0, 20, 0.5 do
+        local before = count("reportArrival")
+        e:tick(time)
+        if count("reportArrival") > before then table.insert(reportTimes, time) end
+    end
+    equal(#reportTimes, 5)
+    for index = 2, #reportTimes do assert(reportTimes[index] - reportTimes[index - 1] >= 3) end
+    equal(count("collectJob"), 0)
+    equal(count("moveToBoard"), 0)
+    equal(e.status.jobs.problem, true)
+    state.drop = nil -- Native walking can still finish the delivery after retries stop.
+    advance(e, 21, 23)
+    equal(count("collectJob"), 1)
+end)
+test("settle timer restarts when server correction moves the character away", function()
+    local e, state, _, count = fixture()
+    state.drop = "destination"
+    e:setMode("jobs"); advance(e, 0, 1)
+    state.distance = 70; e:tick(1.5)
+    state.distance = 3; advance(e, 2, 3)
+    equal(count("reportArrival"), 0)
+    e:tick(3.5)
+    equal(count("reportArrival"), 1)
+end)
+test("local movement inside the arrival radius does not repeatedly teleport", function()
+    local e, state, _, count = fixture()
+    state.drop = "destination"
+    e:setMode("jobs")
+    for time = 0, 8, 0.5 do
+        state.distance = time % 2 == 0 and 12 or 40
+        e:tick(time)
+    end
+    equal(count("moveToDrop"), 1)
+    equal(count("collectJob"), 0)
+end)
+test("invalid distance cannot report arrival", function()
+    local e, state, _, count = fixture()
+    state.drop = "destination"
+    e:setMode("jobs"); e:tick(0)
+    state.distance = 0/0
+    e:tick(1)
+    equal(count("reportArrival"), 0)
+    equal(e.status.jobs.problem, true)
+end)
+test("a failed position sample resets the arrival settling window", function()
+    local e, state, _, count, adapter = fixture()
+    state.drop = "destination"
+    e:setMode("jobs"); advance(e, 0, 1)
+    adapter.getDropDistance = function() error("Character position unavailable", 0) end
+    e:tick(1.5)
+    adapter.getDropDistance = function() return 3 end
+    advance(e, 2.5, 3.5)
+    equal(count("reportArrival"), 0)
+    e:tick(4)
+    equal(count("reportArrival"), 1)
 end)
 test("highest reward is selected from eligible jobs at every unlock boundary", function()
     local cases = { {0, 1, 1}, {2, 1, 1}, {3, 5, 1}, {4, 2, 1}, {7, 2, 1},
@@ -199,13 +256,14 @@ test("eligibility is rechecked before claiming after a stat change", function()
     e:tick(1)
     equal(calls[#calls].args[1], 3)
 end)
-test("stalled delivery retries are bounded and never return to the board", function()
+test("out-of-radius correction attempts are bounded", function()
     local e, state, _, count = fixture()
     state.drop = "destination"
-    e:setMode("jobs")
-    for t = 0, 60 do e:tick(t) end
-    equal(count("collectJob"), 3)
-    equal(count("moveToBoard"), 0)
+    state.distance = 100
+    e:setMode("jobs"); advance(e, 0, 60)
+    equal(count("moveToDrop"), 4) -- Initial approach plus at most three corrections.
+    equal(count("reportArrival"), 0)
+    equal(count("collectJob"), 0)
     equal(count("claimJob"), 0)
     equal(e.status.jobs.problem, true)
 end)

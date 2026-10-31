@@ -174,6 +174,29 @@ local function moveTo(value, distance, offset)
     end
 end
 
+local deliveryHumanoid
+local function stopDeliveryMovement()
+    local humanoid = deliveryHumanoid
+    deliveryHumanoid = nil
+    if humanoid and humanoid.Parent then
+        local part = humanoid.Parent:FindFirstChild("HumanoidRootPart")
+        if part then humanoid:MoveTo(part.Position) end
+    end
+end
+local function approachDelivery(drop)
+    local part = root()
+    local target = location(drop).Position
+    -- Do not teleport again just because normal physics puts us >8 studs away.
+    -- Leave a few studs for normal Humanoid movement after a long-distance reposition.
+    if (part.Position - target).Magnitude > Core.ARRIVAL_RADIUS then
+        part.CFrame = CFrame.new(target + Vector3.new(0, 3, 10))
+        part.AssemblyLinearVelocity = Vector3.zero
+        part.AssemblyAngularVelocity = Vector3.zero
+    end
+    deliveryHumanoid = part.Parent:FindFirstChildOfClass("Humanoid")
+    deliveryHumanoid:MoveTo(target)
+end
+
 local controller = { script = nil, value = nil, loading = false, retry = 0, failure = nil }
 local function jobsController()
     local scripts = player:FindFirstChild("PlayerScripts")
@@ -283,7 +306,9 @@ engine = Core.new({
         moveTo(board, 10, 3)
     end,
     claimJob = function(tier, slot) send("ClaimJob", tier, slot) end,
-    moveToDrop = function(drop) moveTo(drop, 8, 3) end,
+    moveToDrop = approachDelivery,
+    getDropDistance = function(drop) return (root().Position - location(drop).Position).Magnitude end,
+    stopDeliveryMovement = stopDeliveryMovement,
     reportArrival = function() send("ReportJobArrival") end,
     collectJob = function() send("CollectJob") end,
     collectNearestOrb = function()
@@ -795,6 +820,7 @@ connect(player.Idled, function()
     refreshControls()
 end)
 connect(player.CharacterAdded, function()
+    stopDeliveryMovement()
     engine.farmPhase = "start"
     -- A respawn may cancel a job. Re-observe it instead of counting a stale collection.
     engine.jobs = { phase = "idle" }
