@@ -121,7 +121,44 @@ end
 
 function Core:stepJobs(now)
     local job = self.jobs
-    local drop = self.adapter.getDropPoint()
+    local gamePhase = self.adapter.getJobPhase and self.adapter.getJobPhase()
+    local drop
+    if gamePhase == nil or gamePhase == "running" then drop = self.adapter.getDropPoint() end
+    -- The game's DeliveryAutoLockController only uses GetDropPoint in "running".
+    -- A claimed contract must leave its pad normally before teleporting to its target.
+    if gamePhase == "claimed" then
+        job.phase = "leavePad"
+        job.leaveStarted = job.leaveStarted or now
+        if now - job.leaveStarted >= 12 then
+            if not job.leavePaused then self.adapter.stopDeliveryMovement(); job.leavePaused = true end
+            self:report("jobs", "Job still claimed · step off the job pad manually to start running", true)
+            return 1
+        end
+        if now >= (job.nextLeave or 0) then
+            self.adapter.leaveJobPad()
+            job.nextLeave = now + 4
+        end
+        self:report("jobs", "Job claimed · leaving pad normally; waiting for running phase")
+        return 0.5
+    end
+    if job.phase == "leavePad" then
+        self.adapter.stopDeliveryMovement()
+        self.jobs = { phase = "idle" }
+        job = self.jobs
+    end
+    if gamePhase ~= nil and gamePhase ~= "running" then drop = nil end
+    if gamePhase == "running" and self.adapter.getPlayerState then
+        local playerState = self.adapter.getPlayerState()
+        if playerState ~= "RunWorld" then
+            if not job.worldPaused then self.adapter.stopDeliveryMovement(); job.worldPaused = true end
+            job.withinSince = nil
+            job.arrivalClearSince = nil
+            job.clearSince = nil
+            self:report("jobs", "Waiting for running world before delivery movement")
+            return 0.5
+        end
+        job.worldPaused = nil
+    end
     if drop ~= nil then job.lastDrop = drop end
 
     if job.phase == "approach" or job.phase == "awaitArrival" then
@@ -146,14 +183,57 @@ function Core:stepJobs(now)
         if distance > Core.ARRIVAL_RADIUS then
             job.withinSince = nil
             job.arrivalClearSince = nil
+            local diagnostic, returned
+            if self.adapter.getDeliveryDiagnostics then
+                diagnostic, returned = self.adapter.getDeliveryDiagnostics(job.lastDrop)
+            end
+            if returned and job.travelMode ~= "walk" and self.adapter.walkToDrop then
+                self.adapter.stopDeliveryMovement()
+                job.travelMode = "walk"
+                job.bestWalkDistance = distance
+                job.lastWalkProgress = now
+                job.nextWalk = 0
+                self:report("jobs", "Teleport returned to starting area · switching to normal movement", true)
+            end
+            if job.travelMode == "walk" then
+                if distance < job.bestWalkDistance - 2 then
+                    job.bestWalkDistance = distance
+                    job.lastWalkProgress = now
+                end
+                if not job.movementBlocked and now - job.lastWalkProgress >= 12 then
+                    self.adapter.stopDeliveryMovement()
+                    job.movementBlocked = true
+                end
+                if job.movementBlocked then
+                    self:report("jobs", string.format("Normal movement stalled · %.0f studs away · use game controls to reach marker", distance), true)
+                    return 1
+                end
+                if now >= job.nextWalk then
+                    self.adapter.walkToDrop(job.lastDrop)
+                    job.nextWalk = now + 4 -- Humanoid MoveTo times out after eight seconds.
+                end
+                self:report("jobs", string.format("Normal movement after teleport reset · %.0f studs to delivery", distance))
+                return 0.5
+            end
             if (job.repositions or 0) < 3 and now >= (job.nextReposition or 0) then
-                self.adapter.moveToDrop(job.lastDrop)
+                local moved, message, problem = self.adapter.moveToDrop(job.lastDrop)
+                if moved == false then
+                    self:report("jobs", message, problem)
+                    return 0.5
+                end
                 job.repositions = (job.repositions or 0) + 1
                 job.nextReposition = now + 3
+                self:report("jobs", "Repositioned · checking whether the move holds")
+                return 0.3
             end
-            self:report("jobs", "Outside delivery radius · " .. detail, true)
-            return 0.3
+            if (job.repositions or 0) >= 3 and not job.movementBlocked then
+                self.adapter.stopDeliveryMovement()
+                job.movementBlocked = true
+            end
+            self:report("jobs", (job.movementBlocked and "Movement paused · " or "Checking move · ") .. (diagnostic or detail), true)
+            return job.movementBlocked and 1 or 0.3
         end
+        job.movementBlocked = nil
         job.withinSince = job.withinSince or now
         if now - job.withinSince < Core.ARRIVAL_SETTLE then
             self:report("jobs", "Letting position settle · " .. detail)
@@ -212,7 +292,11 @@ function Core:stepJobs(now)
     end
 
     if drop ~= nil then
-        self.adapter.moveToDrop(drop)
+        local moved, message, problem = self.adapter.moveToDrop(drop)
+        if moved == false then
+            self:report("jobs", message, problem)
+            return 0.5
+        end
         job.phase = "approach"
         job.nextReposition = now + 3
         self:report("jobs", "Approaching delivery · waiting for position to settle")
@@ -224,6 +308,10 @@ function Core:stepJobs(now)
         end
         -- A timeout is not a rejection. Never downgrade or send another claim blindly.
         return 0.3
+    end
+    if gamePhase ~= nil and gamePhase ~= "idle" then
+        self:report("jobs", "Game job phase: " .. tostring(gamePhase) .. " · waiting before a new claim")
+        return 0.5
     end
 
     local candidate = Core.bestJob(self.adapter.getAscensions())
@@ -471,7 +559,18 @@ local function moveTo(value, distance, offset)
 end
 
 local deliveryHumanoid
+local deliveryPreparation
+local lastDeliveryMove
+local function cancelPreparation()
+    local previous = deliveryPreparation
+    deliveryPreparation = nil
+    if previous and previous.thread and coroutine.status(previous.thread) ~= "dead" then
+        pcall(task.cancel, previous.thread)
+    end
+end
 local function stopDeliveryMovement()
+    cancelPreparation()
+    lastDeliveryMove = nil
     local humanoid = deliveryHumanoid
     deliveryHumanoid = nil
     if humanoid and humanoid.Parent then
@@ -479,18 +578,92 @@ local function stopDeliveryMovement()
         if part then humanoid:MoveTo(part.Position) end
     end
 end
+local function prepareDeliveryArea(target, character)
+    local current = deliveryPreparation
+    if not current or current.character ~= character or (current.target - target).Magnitude > 5 then
+        cancelPreparation()
+        current = { target = target, character = character, started = os.clock(), streamed = not workspace.StreamingEnabled }
+        deliveryPreparation = current
+        if workspace.StreamingEnabled then
+            -- Streaming can yield. The worker only loads terrain; movement stays in the
+            -- cancellable controller tick, so a late result cannot teleport after Stop.
+            current.thread = task.spawn(function()
+                local loaded, err = pcall(function() player:RequestStreamAroundAsync(target, 5) end)
+                if deliveryPreparation ~= current or not session.alive then return end
+                current.streamed = true
+                if not loaded then current.streamError = tostring(err) end
+            end)
+        end
+    end
+    if not current.streamed then
+        return nil, "Loading delivery area before moving", os.clock() - current.started >= 8
+    end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { character }
+    params.RespectCanCollide = true
+    local hit = workspace:Raycast(target + Vector3.new(0, 40, 0), Vector3.new(0, -90, 0), params)
+    if not hit or hit.Normal.Y < 0.5 then
+        local message = current.streamError and "Streaming unavailable; no loaded ground at delivery"
+            or "Waiting for walkable ground at delivery; movement paused"
+        return nil, message, os.clock() - current.started >= 8
+    end
+    local part = root()
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local standingHeight = humanoid.HipHeight + part.Size.Y / 2 + 0.5
+    local landing = Vector3.new(target.X, hit.Position.Y + standingHeight, target.Z)
+    if (landing - target).Magnitude > Core.ARRIVAL_RADIUS then
+        return nil, "Loaded ground is outside the delivery radius; use the game's route", true
+    end
+    return landing
+end
 local function approachDelivery(drop)
     local part = root()
+    local character = part.Parent
     local target = location(drop).Position
-    -- Do not teleport again just because normal physics puts us >8 studs away.
-    -- Leave a few studs for normal Humanoid movement after a long-distance reposition.
-    if (part.Position - target).Magnitude > Core.ARRIVAL_RADIUS then
-        part.CFrame = CFrame.new(target + Vector3.new(0, 3, 10))
+    local before = part.Position
+    if (before - target).Magnitude > Core.ARRIVAL_RADIUS then
+        local landing, message, problem = prepareDeliveryArea(target, character)
+        if not landing then return false, message, problem end
+        -- Translate the complete character while preserving the root-to-pivot offset.
+        character:PivotTo(character:GetPivot() + (landing - before))
         part.AssemblyLinearVelocity = Vector3.zero
         part.AssemblyAngularVelocity = Vector3.zero
+        lastDeliveryMove = { target = target, before = before, placed = part.Position, time = os.clock(), distance = (part.Position - target).Magnitude }
+        if lastDeliveryMove.distance > Core.ARRIVAL_RADIUS then
+            return false, string.format("Move did not reach delivery: %.1f studs remain", lastDeliveryMove.distance), true
+        end
     end
-    deliveryHumanoid = part.Parent:FindFirstChildOfClass("Humanoid")
+    deliveryHumanoid = character:FindFirstChildOfClass("Humanoid")
     deliveryHumanoid:MoveTo(target)
+    return true
+end
+local function deliveryDiagnostics(drop)
+    local part = root()
+    local target = location(drop).Position
+    local delta = part.Position - target
+    local horizontal = math.sqrt(delta.X * delta.X + delta.Z * delta.Z)
+    local explanation = "Position remains outside delivery radius"
+    local returned = false
+    if lastDeliveryMove then
+        local targetShift = (target - lastDeliveryMove.target).Magnitude
+        if targetShift > Core.ARRIVAL_RADIUS then
+            explanation = string.format("Delivery target changed by %.0f studs", targetShift)
+        elseif lastDeliveryMove.distance <= Core.ARRIVAL_RADIUS then
+            local originalDistance = (lastDeliveryMove.before - target).Magnitude
+            local nearOrigin = (part.Position - lastDeliveryMove.before).Magnitude <= math.max(25, math.min(100, originalDistance * 0.05))
+            returned = nearOrigin and (part.Position - lastDeliveryMove.placed).Magnitude > Core.ARRIVAL_RADIUS
+            if returned then
+                explanation = "Character returned to its pre-teleport position"
+            elseif delta.Y < -50 and part.AssemblyLinearVelocity.Y < -5 then
+                explanation = "Character is falling below delivery ground"
+            else
+                explanation = "Character moved away after a successful local reposition"
+            end
+        end
+    end
+    return string.format("%s · horizontal %.0f, vertical %+.0f studs · player (%.0f, %.0f, %.0f), target (%.0f, %.0f, %.0f)",
+        explanation, horizontal, delta.Y, part.Position.X, part.Position.Y, part.Position.Z, target.X, target.Y, target.Z), returned
 end
 
 local controller = { script = nil, value = nil, loading = false, retry = 0, failure = nil }
@@ -570,9 +743,14 @@ local function ensureOrbIndex()
     for _, object in ipairs(workspace:GetDescendants()) do indexOrb(object) end
 end
 
+local nextWarning = {}
 engine = Core.new({
     onStatus = function(key, text, problem)
-        if problem then log(key .. ": " .. text, true) end
+        -- UI status stays live; changing distances must not flood the console/feed.
+        if problem and os.clock() >= (nextWarning[key] or -math.huge) then
+            nextWarning[key] = os.clock() + 5
+            log(key .. ": " .. text, true)
+        end
     end,
     moveToTreadmill = function(name)
         remote("ChargeStart")
@@ -591,6 +769,22 @@ engine = Core.new({
         if value == nil or value == false then return nil end
         return location(value)
     end,
+    getJobPhase = function()
+        root()
+        local jobs = jobsController()
+        if type(jobs.GetPhase) ~= "function" then error("JobsController phase API is unavailable", 0) end
+        local phase = jobs:GetPhase()
+        if type(phase) ~= "string" or phase == "" then error("Waiting for job phase to load", 0) end
+        return phase
+    end,
+    getPlayerState = function()
+        return player.Character and player.Character:GetAttribute("PlayerState")
+    end,
+    leaveJobPad = function()
+        local part = root()
+        deliveryHumanoid = part.Parent:FindFirstChildOfClass("Humanoid")
+        deliveryHumanoid:MoveTo(part.Position + part.CFrame.LookVector * 16)
+    end,
     moveToBoard = function()
         local geometry = workspace:FindFirstChild("ServerGeometry")
         local board = workspace:FindFirstChild("JobsPart") or (geometry and geometry:FindFirstChild("JobsPart"))
@@ -603,6 +797,12 @@ engine = Core.new({
     end,
     claimJob = function(tier, slot) send("ClaimJob", tier, slot) end,
     moveToDrop = approachDelivery,
+    getDeliveryDiagnostics = deliveryDiagnostics,
+    walkToDrop = function(drop)
+        local part = root()
+        deliveryHumanoid = part.Parent:FindFirstChildOfClass("Humanoid")
+        deliveryHumanoid:MoveTo(location(drop).Position)
+    end,
     getDropDistance = function(drop) return (root().Position - location(drop).Position).Magnitude end,
     stopDeliveryMovement = stopDeliveryMovement,
     reportArrival = function() send("ReportJobArrival") end,

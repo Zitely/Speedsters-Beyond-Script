@@ -1,7 +1,7 @@
 -- A deliberately small Roblox API double for wiring/lifecycle tests, not a game simulator.
 local Mock = {}
 function Mock.new()
-    local mock = { shared = {}, clock = 0, calls = {}, connections = {}, warnings = {}, walks = {} }
+    local mock = { shared = {}, clock = 0, calls = {}, connections = {}, warnings = {}, walks = {}, pivots = {}, streamRequests = {} }
     local function signal()
         local result = { listeners = {} }
         function result:Connect(callback)
@@ -24,8 +24,10 @@ function Mock.new()
     vector.__add = function(a, b) return v(a.X + b.X, a.Y + b.Y, a.Z + b.Z) end
     vector.__sub = function(a, b) return v(a.X - b.X, a.Y - b.Y, a.Z - b.Z) end
     vector.__div = function(a, b) return v(a.X / b, a.Y / b, a.Z / b) end
+    vector.__mul = function(a, b) return v(a.X * b, a.Y * b, a.Z * b) end
     vector.__index = function(a, key) if key == "Magnitude" then return math.sqrt(a.X ^ 2 + a.Y ^ 2 + a.Z ^ 2) end end
     local cf = {}
+    cf.__index = function(_, key) if key == "LookVector" then return v(0, 0, -1) end end
     cf.__add = function(a, b) return setmetatable({ Position = a.Position + b, kind = "CFrame" }, cf) end
     local function cframe(value) return setmetatable({ Position = value or v(0, 0, 0), kind = "CFrame" }, cf) end
     local function udim(scale, offset) return { Scale = scale, Offset = offset } end
@@ -113,9 +115,33 @@ function Mock.new()
         self.WalkToPoint = position
         table.insert(mock.walks, { humanoid = self, position = position, time = mock.clock })
     end
-    function methods:GetPivot() return self:FindFirstChildWhichIsA("BasePart", true).CFrame end
+    function methods:GetPivot()
+        return self:FindFirstChildWhichIsA("BasePart", true).CFrame + (self._props.PivotOffset or v(0, 0, 0))
+    end
+    function methods:PivotTo(target)
+        local delta = target.Position - self:GetPivot().Position
+        for _, part in ipairs(self:GetDescendants()) do
+            if part:IsA("BasePart") then part.CFrame = part.CFrame + delta end
+        end
+        table.insert(mock.pivots, { target = target, time = mock.clock })
+        if mock.onPivot then mock.onPivot(self, target) end
+    end
+    function methods:RequestStreamAroundAsync(target, timeout)
+        table.insert(mock.streamRequests, { target = target, timeout = timeout })
+        if mock.streamError then error(mock.streamError) end
+        if mock.streamYield then
+            mock.streamThread = coroutine.running()
+            coroutine.yield()
+        end
+    end
+    function methods:Raycast(origin, direction, params)
+        assert(params.RespectCanCollide and #params.FilterDescendantsInstances == 1)
+        local ground = mock.groundY or 0
+        if mock.groundLoaded == false or ground > origin.Y or ground < origin.Y + direction.Y then return nil end
+        return { Position = v(origin.X, ground, origin.Z), Normal = v(0, 1, 0) }
+    end
     local function instance(class, name, parent)
-        local item = setmetatable({ _props = { ClassName = class, Name = name or class, Visible = true, Position = size(0, 0, 0, 0), CFrame = cframe(), Health = 100 }, _children = {}, _signals = {} }, instanceMt)
+        local item = setmetatable({ _props = { ClassName = class, Name = name or class, Visible = true, Position = size(0, 0, 0, 0), CFrame = cframe(), Health = 100, HipHeight = 2, Size = v(2, 2, 1), AssemblyLinearVelocity = v(0, 0, 0) }, _children = {}, _signals = {} }, instanceMt)
         item.Parent = parent
         return item
     end
@@ -126,12 +152,16 @@ function Mock.new()
     player:SetAttribute("Ascensions", 10)
     local playerGui = instance("PlayerGui", "PlayerGui", player)
     player.Character = instance("Model")
+    player.Character:SetAttribute("PlayerState", "RunWorld")
     instance("Part", "HumanoidRootPart", player.Character)
     instance("Humanoid", "Humanoid", player.Character)
     local scripts = instance("Folder", "PlayerScripts", player)
     local controllers = instance("Folder", "Controllers", scripts)
     local module = instance("ModuleScript", "JobsController", controllers)
-    module.value = { GetDropPoint = function() return mock.drop end }
+    module.value = {
+        GetDropPoint = function() return mock.drop end,
+        GetPhase = function() return mock.phase or (mock.drop and "running" or "idle") end,
+    }
     local replicated = instance("ReplicatedStorage")
     local remotes = instance("Folder", "Remotes", replicated)
     for _, name in ipairs({ "ChargeStart", "ChargeBurst", "ClaimJob", "ReportJobArrival", "CollectJob", "OrbCollect", "ResetRace", "AscendRequest", "BuyUpgrade" }) do instance("RemoteEvent", name, remotes) end
@@ -159,6 +189,7 @@ function Mock.new()
         Color3 = { fromRGB = function(r, g, b) return { R = r, G = g, B = b } end },
         ColorSequence = { new = function(...) return { ... } end },
         TweenInfo = { new = function(...) return { ... } end },
+        RaycastParams = { new = function() return {} end },
         UDim = { new = udim }, UDim2 = { new = size, fromOffset = function(x, y) return size(0, x, 0, y) end, fromScale = function(x, y) return size(x, 0, y, 0) end },
         Vector2 = { new = v, zero = v(0, 0) }, Vector3 = { new = v, zero = v(0, 0, 0) }, CFrame = { new = cframe },
         typeof = function(value) return type(value) == "table" and (value.kind or (value._props and "Instance")) or type(value) end,

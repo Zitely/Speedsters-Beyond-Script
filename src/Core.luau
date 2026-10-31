@@ -119,7 +119,44 @@ end
 
 function Core:stepJobs(now)
     local job = self.jobs
-    local drop = self.adapter.getDropPoint()
+    local gamePhase = self.adapter.getJobPhase and self.adapter.getJobPhase()
+    local drop
+    if gamePhase == nil or gamePhase == "running" then drop = self.adapter.getDropPoint() end
+    -- The game's DeliveryAutoLockController only uses GetDropPoint in "running".
+    -- A claimed contract must leave its pad normally before teleporting to its target.
+    if gamePhase == "claimed" then
+        job.phase = "leavePad"
+        job.leaveStarted = job.leaveStarted or now
+        if now - job.leaveStarted >= 12 then
+            if not job.leavePaused then self.adapter.stopDeliveryMovement(); job.leavePaused = true end
+            self:report("jobs", "Job still claimed · step off the job pad manually to start running", true)
+            return 1
+        end
+        if now >= (job.nextLeave or 0) then
+            self.adapter.leaveJobPad()
+            job.nextLeave = now + 4
+        end
+        self:report("jobs", "Job claimed · leaving pad normally; waiting for running phase")
+        return 0.5
+    end
+    if job.phase == "leavePad" then
+        self.adapter.stopDeliveryMovement()
+        self.jobs = { phase = "idle" }
+        job = self.jobs
+    end
+    if gamePhase ~= nil and gamePhase ~= "running" then drop = nil end
+    if gamePhase == "running" and self.adapter.getPlayerState then
+        local playerState = self.adapter.getPlayerState()
+        if playerState ~= "RunWorld" then
+            if not job.worldPaused then self.adapter.stopDeliveryMovement(); job.worldPaused = true end
+            job.withinSince = nil
+            job.arrivalClearSince = nil
+            job.clearSince = nil
+            self:report("jobs", "Waiting for running world before delivery movement")
+            return 0.5
+        end
+        job.worldPaused = nil
+    end
     if drop ~= nil then job.lastDrop = drop end
 
     if job.phase == "approach" or job.phase == "awaitArrival" then
@@ -144,14 +181,57 @@ function Core:stepJobs(now)
         if distance > Core.ARRIVAL_RADIUS then
             job.withinSince = nil
             job.arrivalClearSince = nil
+            local diagnostic, returned
+            if self.adapter.getDeliveryDiagnostics then
+                diagnostic, returned = self.adapter.getDeliveryDiagnostics(job.lastDrop)
+            end
+            if returned and job.travelMode ~= "walk" and self.adapter.walkToDrop then
+                self.adapter.stopDeliveryMovement()
+                job.travelMode = "walk"
+                job.bestWalkDistance = distance
+                job.lastWalkProgress = now
+                job.nextWalk = 0
+                self:report("jobs", "Teleport returned to starting area · switching to normal movement", true)
+            end
+            if job.travelMode == "walk" then
+                if distance < job.bestWalkDistance - 2 then
+                    job.bestWalkDistance = distance
+                    job.lastWalkProgress = now
+                end
+                if not job.movementBlocked and now - job.lastWalkProgress >= 12 then
+                    self.adapter.stopDeliveryMovement()
+                    job.movementBlocked = true
+                end
+                if job.movementBlocked then
+                    self:report("jobs", string.format("Normal movement stalled · %.0f studs away · use game controls to reach marker", distance), true)
+                    return 1
+                end
+                if now >= job.nextWalk then
+                    self.adapter.walkToDrop(job.lastDrop)
+                    job.nextWalk = now + 4 -- Humanoid MoveTo times out after eight seconds.
+                end
+                self:report("jobs", string.format("Normal movement after teleport reset · %.0f studs to delivery", distance))
+                return 0.5
+            end
             if (job.repositions or 0) < 3 and now >= (job.nextReposition or 0) then
-                self.adapter.moveToDrop(job.lastDrop)
+                local moved, message, problem = self.adapter.moveToDrop(job.lastDrop)
+                if moved == false then
+                    self:report("jobs", message, problem)
+                    return 0.5
+                end
                 job.repositions = (job.repositions or 0) + 1
                 job.nextReposition = now + 3
+                self:report("jobs", "Repositioned · checking whether the move holds")
+                return 0.3
             end
-            self:report("jobs", "Outside delivery radius · " .. detail, true)
-            return 0.3
+            if (job.repositions or 0) >= 3 and not job.movementBlocked then
+                self.adapter.stopDeliveryMovement()
+                job.movementBlocked = true
+            end
+            self:report("jobs", (job.movementBlocked and "Movement paused · " or "Checking move · ") .. (diagnostic or detail), true)
+            return job.movementBlocked and 1 or 0.3
         end
+        job.movementBlocked = nil
         job.withinSince = job.withinSince or now
         if now - job.withinSince < Core.ARRIVAL_SETTLE then
             self:report("jobs", "Letting position settle · " .. detail)
@@ -210,7 +290,11 @@ function Core:stepJobs(now)
     end
 
     if drop ~= nil then
-        self.adapter.moveToDrop(drop)
+        local moved, message, problem = self.adapter.moveToDrop(drop)
+        if moved == false then
+            self:report("jobs", message, problem)
+            return 0.5
+        end
         job.phase = "approach"
         job.nextReposition = now + 3
         self:report("jobs", "Approaching delivery · waiting for position to settle")
@@ -222,6 +306,10 @@ function Core:stepJobs(now)
         end
         -- A timeout is not a rejection. Never downgrade or send another claim blindly.
         return 0.3
+    end
+    if gamePhase ~= nil and gamePhase ~= "idle" then
+        self:report("jobs", "Game job phase: " .. tostring(gamePhase) .. " · waiting before a new claim")
+        return 0.5
     end
 
     local candidate = Core.bestJob(self.adapter.getAscensions())
