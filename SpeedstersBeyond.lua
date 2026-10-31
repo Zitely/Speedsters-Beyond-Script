@@ -595,26 +595,26 @@ local function prepareDeliveryArea(target, character)
             end)
         end
     end
-    if not current.streamed then
-        return nil, "Loading delivery area before moving", os.clock() - current.started >= 8
+    if not current.streamed and os.clock() - current.started < 2 then
+        return nil, "Preparing delivery area · waiting up to 2 seconds", false
     end
+    -- A raycast cannot prove that a delivery point is unusable: the surface can be
+    -- streamed out, non-queryable, sloped, or offset from the marker. Treat it only
+    -- as a landing-height hint and retain the game's own destination as fallback.
+    local fallback = target + Vector3.new(0, 3, 0)
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = { character }
     params.RespectCanCollide = true
-    local hit = workspace:Raycast(target + Vector3.new(0, 40, 0), Vector3.new(0, -90, 0), params)
-    if not hit or hit.Normal.Y < 0.5 then
-        local message = current.streamError and "Streaming unavailable; no loaded ground at delivery"
-            or "Waiting for walkable ground at delivery; movement paused"
-        return nil, message, os.clock() - current.started >= 8
-    end
+    local queried, hit = pcall(function()
+        return workspace:Raycast(target + Vector3.new(0, 40, 0), Vector3.new(0, -90, 0), params)
+    end)
+    if not queried or not hit or hit.Normal.Y < 0.5 then return fallback end
     local part = root()
     local humanoid = character:FindFirstChildOfClass("Humanoid")
     local standingHeight = humanoid.HipHeight + part.Size.Y / 2 + 0.5
     local landing = Vector3.new(target.X, hit.Position.Y + standingHeight, target.Z)
-    if (landing - target).Magnitude > Core.ARRIVAL_RADIUS then
-        return nil, "Loaded ground is outside the delivery radius; use the game's route", true
-    end
+    if (landing - target).Magnitude > Core.ARRIVAL_RADIUS then return fallback end
     return landing
 end
 local function approachDelivery(drop)

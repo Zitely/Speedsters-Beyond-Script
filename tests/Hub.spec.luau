@@ -412,16 +412,55 @@ test("stopping a pending stream request cannot teleport later", function()
     assert(#m.pivots == 0 and #m.calls == 0)
     s.destroy()
 end)
-test("missing ground pauses movement and recovers when terrain is loaded", function()
+test("a missed ground probe uses the game's destination without blocking the job", function()
     local m = Mock.new()
     local s = m.load(BUNDLE)
     m.groundLoaded = false
     m.drop = m.vector(100, 0, 0)
-    m.toggle("Auto job & deliver"); advance(m, 0, 10)
-    assert(#m.pivots == 0 and #m.calls == 0 and s.engine.status.jobs.problem)
-    m.groundLoaded = true
-    m.tick(10.5)
-    assert(#m.pivots == 1)
+    m.toggle("Auto job & deliver"); m.tick(0)
+    local position = m.player.Character:FindFirstChild("HumanoidRootPart").Position
+    assert(#m.pivots == 1 and position.X == 100 and position.Y == 3 and position.Z == 0)
+    assert(not s.engine.status.jobs.problem)
+    advance(m, 0.5, 2)
+    assert(m.calls[1].name == "ReportJobArrival")
+    m.drop = nil
+    advance(m, 2.5, 8)
+    assert(s.engine.deliveries == 1)
+    s.destroy()
+end)
+test("a stalled stream request waits at most two seconds before using the destination", function()
+    local m = Mock.new()
+    local s = m.load(BUNDLE)
+    m.workspace.StreamingEnabled = true
+    m.streamYield = true
+    m.groundLoaded = false
+    m.drop = m.vector(100, 0, 0)
+    m.toggle("Auto job & deliver"); advance(m, 0, 1.5)
+    assert(#m.pivots == 0 and #m.streamRequests == 1)
+    m.tick(2)
+    assert(#m.pivots == 1 and not s.engine.status.jobs.problem)
+    s.destroy()
+    assert(coroutine.status(m.streamThread) == "dead")
+end)
+test("a sloped or unavailable ground query cannot block a valid delivery point", function()
+    for _, reason in ipairs({ "slope", "error" }) do
+        local m = Mock.new()
+        local s = m.load(BUNDLE)
+        if reason == "slope" then m.groundNormal = m.vector(0.9, 0.2, 0) else m.raycastError = true end
+        m.drop = m.vector(100, 0, 0)
+        m.toggle("Auto job & deliver"); m.tick(0)
+        local position = m.player.Character:FindFirstChild("HumanoidRootPart").Position
+        assert(#m.pivots == 1 and position.Y == 3 and not s.engine.status.jobs.problem)
+        s.destroy()
+    end
+end)
+test("an unusable ground-height hint falls back within the arrival radius", function()
+    local m = Mock.new()
+    local s = m.load(BUNDLE)
+    m.player.Character:FindFirstChildOfClass("Humanoid").HipHeight = 60
+    m.drop = m.vector(100, 0, 0)
+    m.toggle("Auto job & deliver"); m.tick(0)
+    assert(#m.pivots == 1 and s.engine.adapter.getDropDistance(m.drop) == 3)
     s.destroy()
 end)
 test("changing stalled distances do not flood the console", function()

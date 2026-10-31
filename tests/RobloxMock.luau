@@ -136,9 +136,10 @@ function Mock.new()
     end
     function methods:Raycast(origin, direction, params)
         assert(params.RespectCanCollide and #params.FilterDescendantsInstances == 1)
+        if mock.raycastError then error("Ground query unavailable") end
         local ground = mock.groundY or 0
         if mock.groundLoaded == false or ground > origin.Y or ground < origin.Y + direction.Y then return nil end
-        return { Position = v(origin.X, ground, origin.Z), Normal = v(0, 1, 0) }
+        return { Position = v(origin.X, ground, origin.Z), Normal = mock.groundNormal or v(0, 1, 0) }
     end
     local function instance(class, name, parent)
         local item = setmetatable({ _props = { ClassName = class, Name = name or class, Visible = true, Position = size(0, 0, 0, 0), CFrame = cframe(), Health = 100, HipHeight = 2, Size = v(2, 2, 1), AssemblyLinearVelocity = v(0, 0, 0) }, _children = {}, _signals = {} }, instanceMt)
