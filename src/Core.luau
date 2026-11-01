@@ -51,12 +51,12 @@ function Core.new(adapter)
     }, Core)
 end
 
-function Core:report(key, text, problem)
+function Core:report(key, text, problem, issue)
     local old = self.status[key]
-    if not old or old.text ~= text or old.problem ~= (problem == true) then
-        self.status[key] = { text = text, problem = problem == true }
+    if not old or old.text ~= text or old.problem ~= (problem == true) or old.issue ~= issue then
+        self.status[key] = { text = text, problem = problem == true, issue = issue }
         if self.adapter.onStatus then
-            self.adapter.onStatus(key, text, problem == true)
+            self.adapter.onStatus(key, text, problem == true, issue)
         end
     end
 end
@@ -104,6 +104,7 @@ function Core:run(key, statusKey, now, callback)
         self.due[key] = now + (delay or 1)
     else
         if statusKey == "jobs" then
+            self.adapter.stopDeliveryMovement()
             -- An unreadable sample is not evidence of continuous proximity/completion.
             self.jobs.withinSince = nil
             self.jobs.arrivalClearSince = nil
@@ -123,7 +124,7 @@ function Core:stepJobs(now)
     local drop
     if gamePhase == nil or gamePhase == "running" then drop = self.adapter.getDropPoint() end
     -- The game's DeliveryAutoLockController only uses GetDropPoint in "running".
-    -- A claimed contract must leave its pad normally before teleporting to its target.
+    -- A claimed contract must leave its pad before following its live target.
     if gamePhase == "claimed" then
         job.phase = "leavePad"
         job.leaveStarted = job.leaveStarted or now
@@ -157,11 +158,18 @@ function Core:stepJobs(now)
         end
         job.worldPaused = nil
     end
-    if drop ~= nil then job.lastDrop = drop end
+    if drop ~= nil then
+        if job.lastDrop and self.adapter.sameDropPoint and not self.adapter.sameDropPoint(job.lastDrop, drop) then
+            self.adapter.stopDeliveryMovement()
+            self.jobs = { phase = "idle", choice = job.choice }
+            job = self.jobs
+        end
+        job.lastDrop = drop
+    end
 
     if job.phase == "approach" or job.phase == "awaitArrival" then
         -- A game-side completion can move the player too. Once arrival was reported,
-        -- observe a cleared destination before considering any position corrections.
+        -- observe a cleared destination before moving toward another destination.
         if job.phase == "awaitArrival" and drop == nil then
             job.arrivalClearSince = job.arrivalClearSince or now
             if now - job.arrivalClearSince >= Core.ARRIVAL_CLEAR then
@@ -178,58 +186,33 @@ function Core:stepJobs(now)
         local attempts = job.arrivalAttempts or 0
         local detail = string.format("%.1f / %d studs · arrival %d/%d", distance, Core.ARRIVAL_RADIUS, attempts, Core.ARRIVAL_ATTEMPTS)
 
+        if attempts >= Core.ARRIVAL_ATTEMPTS then
+            if not job.arrivalPaused then self.adapter.stopDeliveryMovement(); job.arrivalPaused = true end
+            self:report("jobs", "Arrival unconfirmed · " .. detail .. " · try walking to marker", true)
+            return 0.5
+        end
+
         if distance > Core.ARRIVAL_RADIUS then
             job.withinSince = nil
             job.arrivalClearSince = nil
-            local diagnostic, returned
-            if self.adapter.getDeliveryDiagnostics then
-                diagnostic, returned = self.adapter.getDeliveryDiagnostics(job.lastDrop)
+            job.bestTravelDistance = job.bestTravelDistance or distance
+            job.lastTravelProgress = job.lastTravelProgress or now
+            if distance < job.bestTravelDistance - 2 then
+                job.bestTravelDistance = distance
+                job.lastTravelProgress = now
             end
-            if returned and job.travelMode ~= "walk" and self.adapter.walkToDrop then
-                self.adapter.stopDeliveryMovement()
-                job.travelMode = "walk"
-                job.bestWalkDistance = distance
-                job.lastWalkProgress = now
-                job.nextWalk = 0
-                self:report("jobs", "Teleport returned to starting area · switching to normal movement", true)
-            end
-            if job.travelMode == "walk" then
-                if distance < job.bestWalkDistance - 2 then
-                    job.bestWalkDistance = distance
-                    job.lastWalkProgress = now
-                end
-                if not job.movementBlocked and now - job.lastWalkProgress >= 12 then
-                    self.adapter.stopDeliveryMovement()
-                    job.movementBlocked = true
-                end
-                if job.movementBlocked then
-                    self:report("jobs", string.format("Normal movement stalled · %.0f studs away · use game controls to reach marker", distance), true)
-                    return 1
-                end
-                if now >= job.nextWalk then
-                    self.adapter.walkToDrop(job.lastDrop)
-                    job.nextWalk = now + 4 -- Humanoid MoveTo times out after eight seconds.
-                end
-                self:report("jobs", string.format("Normal movement after teleport reset · %.0f studs to delivery", distance))
-                return 0.5
-            end
-            if (job.repositions or 0) < 3 and now >= (job.nextReposition or 0) then
-                local moved, message, problem = self.adapter.moveToDrop(job.lastDrop)
-                if moved == false then
-                    self:report("jobs", message, problem)
-                    return 0.5
-                end
-                job.repositions = (job.repositions or 0) + 1
-                job.nextReposition = now + 3
-                self:report("jobs", "Repositioned · checking whether the move holds")
-                return 0.3
-            end
-            if (job.repositions or 0) >= 3 and not job.movementBlocked then
+            if not job.movementBlocked and now - job.lastTravelProgress >= 12 then
                 self.adapter.stopDeliveryMovement()
                 job.movementBlocked = true
             end
-            self:report("jobs", (job.movementBlocked and "Movement paused · " or "Checking move · ") .. (diagnostic or detail), true)
-            return job.movementBlocked and 1 or 0.3
+            if job.movementBlocked then
+                self:report("jobs", string.format("Running input stalled · %.0f studs away · travel paused", distance), true, "travel_stalled")
+                return 1
+            end
+            self.adapter.moveToDrop(job.lastDrop)
+            local problem = self.adapter.getDeliveryMovementProblem and self.adapter.getDeliveryMovementProblem()
+            self:report("jobs", problem or string.format("Steering through game movement · %.0f studs to delivery", distance), problem ~= nil)
+            return 0.3
         end
         job.movementBlocked = nil
         job.withinSince = job.withinSince or now
@@ -238,10 +221,6 @@ function Core:stepJobs(now)
             return 0.3
         end
 
-        if attempts >= Core.ARRIVAL_ATTEMPTS then
-            self:report("jobs", "Arrival unconfirmed · " .. detail .. " · try walking to marker", true)
-            return 0.5
-        end
         if now >= (job.nextArrival or 0) then
             self.adapter.reportArrival()
             job.arrivalAttempts = attempts + 1
@@ -296,7 +275,8 @@ function Core:stepJobs(now)
             return 0.5
         end
         job.phase = "approach"
-        job.nextReposition = now + 3
+        job.bestTravelDistance = self.adapter.getDropDistance(drop)
+        job.lastTravelProgress = now
         self:report("jobs", "Approaching delivery · waiting for position to settle")
         return 0.3
     end
@@ -314,13 +294,36 @@ function Core:stepJobs(now)
 
     local candidate = Core.bestJob(self.adapter.getAscensions())
     if job.phase ~= "claim" then
-        self.adapter.moveToBoard()
+        if job.boardPaused then
+            self:report("jobs", "Travel to job board stalled · restart Jobs after reaching the board", true, "board_stalled")
+            return 1
+        end
+        local reached, distance = self.adapter.moveToBoard()
+        if reached == false then
+            job.bestBoardDistance = job.bestBoardDistance or distance
+            job.boardProgressAt = job.boardProgressAt or now
+            if distance < job.bestBoardDistance - 2 then
+                job.bestBoardDistance = distance
+                job.boardProgressAt = now
+            end
+            if now - job.boardProgressAt >= 12 then
+                self.adapter.stopDeliveryMovement()
+                job.boardPaused = true
+            end
+            self:report("jobs", string.format("Travelling to job board · %.0f studs remaining", distance))
+            return 0.3
+        end
         job.phase = "claim"
         self:report("jobs", "At board · selected " .. candidate.name .. " (" .. candidate.reward .. ")")
         return 0.8
     end
     -- Recheck eligibility immediately before the request; ascension may have changed.
+    if self.adapter.isAtBoard and not self.adapter.isAtBoard() then
+        job.phase = "idle"
+        return 0.3
+    end
     self.adapter.claimJob(candidate.tier, candidate.jobType)
+    self.adapter.stopDeliveryMovement()
     job.choice = candidate
     job.phase = "waiting"
     job.deadline = now + 12

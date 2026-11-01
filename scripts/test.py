@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LUAU = os.environ.get("LUAU_BIN", "luau")
 subprocess.run(["python3", str(ROOT / "scripts/build.py"), "--check"], check=True)
 subprocess.run([LUAU, str(ROOT / "tests/Core.spec.luau")], check=True, cwd=ROOT)
+subprocess.run([LUAU, str(ROOT / "tests/Movement.spec.luau")], check=True, cwd=ROOT)
 bundle = (ROOT / "SpeedstersBeyond.lua").read_text()
 loader = (ROOT / "Loader.lua").read_text()
 readme_loader = (ROOT / "README.md").read_text().split("```lua\n", 1)[1].split("```", 1)[0]

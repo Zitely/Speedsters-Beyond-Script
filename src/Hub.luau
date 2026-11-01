@@ -1,4 +1,4 @@
--- Roblox client adapter and UI. Core is embedded above this file by scripts/build.py.
+-- Roblox client adapter and UI. Core and Movement are embedded by scripts/build.py.
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
@@ -38,7 +38,7 @@ for _, parent in ipairs(parentGui == playerGui and { playerGui } or { playerGui,
     end
 end
 
-local session = { alive = true, connections = {}, threads = {}, tweens = {} }
+local session = { alive = true, connections = {}, threads = {}, tweens = {}, renderBindings = {} }
 shared.SpeedstersBeyondSession = session
 local engine
 local gui
@@ -53,6 +53,7 @@ function session.destroy()
     if not session.alive then return end
     session.alive = false
     if engine then engine:destroy() end
+    for _, name in ipairs(session.renderBindings) do RunService:UnbindFromRenderStep(name) end
     for _, connection in ipairs(session.connections) do connection:Disconnect() end
     for _, thread in ipairs(session.threads) do
         if coroutine.status(thread) ~= "dead" then pcall(task.cancel, thread) end
@@ -174,114 +175,6 @@ local function moveTo(value, distance, offset)
     end
 end
 
-local deliveryHumanoid
-local deliveryPreparation
-local lastDeliveryMove
-local function cancelPreparation()
-    local previous = deliveryPreparation
-    deliveryPreparation = nil
-    if previous and previous.thread and coroutine.status(previous.thread) ~= "dead" then
-        pcall(task.cancel, previous.thread)
-    end
-end
-local function stopDeliveryMovement()
-    cancelPreparation()
-    lastDeliveryMove = nil
-    local humanoid = deliveryHumanoid
-    deliveryHumanoid = nil
-    if humanoid and humanoid.Parent then
-        local part = humanoid.Parent:FindFirstChild("HumanoidRootPart")
-        if part then humanoid:MoveTo(part.Position) end
-    end
-end
-local function prepareDeliveryArea(target, character)
-    local current = deliveryPreparation
-    if not current or current.character ~= character or (current.target - target).Magnitude > 5 then
-        cancelPreparation()
-        current = { target = target, character = character, started = os.clock(), streamed = not workspace.StreamingEnabled }
-        deliveryPreparation = current
-        if workspace.StreamingEnabled then
-            -- Streaming can yield. The worker only loads terrain; movement stays in the
-            -- cancellable controller tick, so a late result cannot teleport after Stop.
-            current.thread = task.spawn(function()
-                local loaded, err = pcall(function() player:RequestStreamAroundAsync(target, 5) end)
-                if deliveryPreparation ~= current or not session.alive then return end
-                current.streamed = true
-                if not loaded then current.streamError = tostring(err) end
-            end)
-        end
-    end
-    if not current.streamed and os.clock() - current.started < 2 then
-        return nil, "Preparing delivery area · waiting up to 2 seconds", false
-    end
-    -- A raycast cannot prove that a delivery point is unusable: the surface can be
-    -- streamed out, non-queryable, sloped, or offset from the marker. Treat it only
-    -- as a landing-height hint and retain the game's own destination as fallback.
-    local fallback = target + Vector3.new(0, 3, 0)
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = { character }
-    params.RespectCanCollide = true
-    local queried, hit = pcall(function()
-        return workspace:Raycast(target + Vector3.new(0, 40, 0), Vector3.new(0, -90, 0), params)
-    end)
-    if not queried or not hit or hit.Normal.Y < 0.5 then return fallback end
-    local part = root()
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    local standingHeight = humanoid.HipHeight + part.Size.Y / 2 + 0.5
-    local landing = Vector3.new(target.X, hit.Position.Y + standingHeight, target.Z)
-    if (landing - target).Magnitude > Core.ARRIVAL_RADIUS then return fallback end
-    return landing
-end
-local function approachDelivery(drop)
-    local part = root()
-    local character = part.Parent
-    local target = location(drop).Position
-    local before = part.Position
-    if (before - target).Magnitude > Core.ARRIVAL_RADIUS then
-        local landing, message, problem = prepareDeliveryArea(target, character)
-        if not landing then return false, message, problem end
-        -- Translate the complete character while preserving the root-to-pivot offset.
-        character:PivotTo(character:GetPivot() + (landing - before))
-        part.AssemblyLinearVelocity = Vector3.zero
-        part.AssemblyAngularVelocity = Vector3.zero
-        lastDeliveryMove = { target = target, before = before, placed = part.Position, time = os.clock(), distance = (part.Position - target).Magnitude }
-        if lastDeliveryMove.distance > Core.ARRIVAL_RADIUS then
-            return false, string.format("Move did not reach delivery: %.1f studs remain", lastDeliveryMove.distance), true
-        end
-    end
-    deliveryHumanoid = character:FindFirstChildOfClass("Humanoid")
-    deliveryHumanoid:MoveTo(target)
-    return true
-end
-local function deliveryDiagnostics(drop)
-    local part = root()
-    local target = location(drop).Position
-    local delta = part.Position - target
-    local horizontal = math.sqrt(delta.X * delta.X + delta.Z * delta.Z)
-    local explanation = "Position remains outside delivery radius"
-    local returned = false
-    if lastDeliveryMove then
-        local targetShift = (target - lastDeliveryMove.target).Magnitude
-        if targetShift > Core.ARRIVAL_RADIUS then
-            explanation = string.format("Delivery target changed by %.0f studs", targetShift)
-        elseif lastDeliveryMove.distance <= Core.ARRIVAL_RADIUS then
-            local originalDistance = (lastDeliveryMove.before - target).Magnitude
-            local nearOrigin = (part.Position - lastDeliveryMove.before).Magnitude <= math.max(25, math.min(100, originalDistance * 0.05))
-            returned = nearOrigin and (part.Position - lastDeliveryMove.placed).Magnitude > Core.ARRIVAL_RADIUS
-            if returned then
-                explanation = "Character returned to its pre-teleport position"
-            elseif delta.Y < -50 and part.AssemblyLinearVelocity.Y < -5 then
-                explanation = "Character is falling below delivery ground"
-            else
-                explanation = "Character moved away after a successful local reposition"
-            end
-        end
-    end
-    return string.format("%s · horizontal %.0f, vertical %+.0f studs · player (%.0f, %.0f, %.0f), target (%.0f, %.0f, %.0f)",
-        explanation, horizontal, delta.Y, part.Position.X, part.Position.Y, part.Position.Z, target.X, target.Y, target.Z), returned
-end
-
 local controller = { script = nil, value = nil, loading = false, retry = 0, failure = nil }
 local function jobsController()
     local scripts = player:FindFirstChild("PlayerScripts")
@@ -316,6 +209,123 @@ local function jobsController()
         error("JobsController is still loading; rejoin if this persists", 0)
     end
     error(current.failure or "Loading JobsController", 0)
+end
+
+-- Default Roblox controls run at Input (100); the supplied SpeedstersMovement runs
+-- at Input+1 (101). While steering, suspend only default player input, write MoveDirection
+-- at 100, and let the game's own momentum step apply its normal velocity at 101.
+local controlsCache = { loading = false, retry = 0 }
+local driveGoal
+local ownedControls
+local movementProblem
+local movementBindingError
+local function playerControls()
+    if controlsCache.value then return controlsCache.value end
+    if not controlsCache.loading and os.clock() >= controlsCache.retry then
+        local scripts = player:FindFirstChild("PlayerScripts")
+        local module = scripts and scripts:FindFirstChild("PlayerModule")
+        if not module or not module:IsA("ModuleScript") then error("PlayerModule controls are unavailable", 0) end
+        controlsCache.loading = true
+        local thread = task.spawn(function()
+            local loaded, result = pcall(function()
+                local api = require(module)
+                assert(type(api) == "table" and type(api.GetControls) == "function", "PlayerModule has no GetControls")
+                local controls = api:GetControls()
+                assert(type(controls) == "table" and type(controls.Enable) == "function" and type(controls.Disable) == "function", "Player controls cannot be acquired")
+                assert(type(controls.controlsEnabled) == "boolean", "Player controls do not expose their enabled state")
+                return controls
+            end)
+            if not session.alive then return end
+            controlsCache.loading = false
+            controlsCache.retry = os.clock() + 5
+            if loaded then controlsCache.value = result else controlsCache.failure = tostring(result) end
+        end)
+        table.insert(session.threads, thread)
+    end
+    if controlsCache.value then return controlsCache.value end
+    error(controlsCache.failure or "Loading player movement controls", 0)
+end
+local function stopDeliveryMovement()
+    local previous = driveGoal
+    driveGoal = nil
+    if previous and previous.humanoid.Parent then
+        pcall(function() previous.humanoid:Move(Vector3.zero, false) end)
+    end
+    if ownedControls then
+        local controls = ownedControls
+        ownedControls = nil
+        local restored, err = pcall(function() controls:Enable() end)
+        if not restored then log("Could not restore player input: " .. tostring(err), true) end
+    end
+end
+local function beginDrive(target, phase, stopRadius)
+    if movementBindingError then error(movementBindingError, 0) end
+    local part = root()
+    if part.Parent:GetAttribute("PlayerState") ~= "RunWorld" then
+        stopDeliveryMovement()
+        error("Waiting for RunWorld movement", 0)
+    end
+    local controls = playerControls()
+    if ownedControls ~= controls then
+        stopDeliveryMovement()
+        if not controls.controlsEnabled then error("Player controls are disabled by the game; waiting", 0) end
+        ownedControls = controls
+        local disabled, err = pcall(function() controls:Disable() end)
+        if not disabled then stopDeliveryMovement(); error(tostring(err), 0) end
+    end
+    local changed = not driveGoal or driveGoal.character ~= part.Parent or driveGoal.phase ~= phase
+    driveGoal = {
+        target = target, phase = phase, stopRadius = stopRadius or Movement.STOP_RADIUS,
+        character = part.Parent, humanoid = part.Parent:FindFirstChildOfClass("Humanoid"),
+    }
+    if changed then movementProblem = nil end
+    return true
+end
+local function steerDelivery(dt)
+    local goal = driveGoal
+    if not goal or not session.alive then return end
+    if player.Character ~= goal.character or goal.humanoid.Health <= 0 then
+        stopDeliveryMovement()
+        return
+    end
+    if goal.character:GetAttribute("PlayerState") ~= "RunWorld" then
+        movementProblem = "Waiting for RunWorld movement"
+        stopDeliveryMovement()
+        return
+    end
+    local jobs = controller.value
+    if not jobs or type(jobs.GetPhase) ~= "function" or jobs:GetPhase() ~= goal.phase then
+        stopDeliveryMovement()
+        return
+    end
+    local target = goal.target
+    if goal.phase == "running" then
+        local live = jobs:GetDropPoint()
+        if not live then stopDeliveryMovement(); return end
+        target = location(live).Position
+    end
+    local part = root()
+    local delta = target - part.Position
+    local velocity = part.AssemblyLinearVelocity
+    local x, z, state = Movement.steer(delta.X, delta.Y, delta.Z, velocity.X, velocity.Z, dt, goal.stopRadius)
+    movementProblem = state == "vertical" and "Delivery target needs vertical travel; use the game's route" or nil
+    goal.humanoid:Move(Vector3.new(x, 0, z), false)
+end
+local steeringBinding = "SpeedstersBeyondDeliveryInput"
+local bound, bindingError = pcall(function()
+    RunService:BindToRenderStep(steeringBinding, Enum.RenderPriority.Input.Value, function(dt)
+        if not session.alive then return end
+        local steered, err = pcall(steerDelivery, dt)
+        if not steered then
+            movementProblem = "Movement input unavailable: " .. tostring(err)
+            stopDeliveryMovement()
+        end
+    end)
+end)
+if bound then
+    table.insert(session.renderBindings, steeringBinding)
+else
+    movementBindingError = "Cannot schedule delivery input: " .. tostring(bindingError)
 end
 
 local ascensionOverride
@@ -360,9 +370,21 @@ local function ensureOrbIndex()
 end
 
 local nextWarning = {}
+local reportedIssue = {}
 engine = Core.new({
-    onStatus = function(key, text, problem)
+    onStatus = function(key, text, problem, issue)
         -- UI status stays live; changing distances must not flood the console/feed.
+        if not problem then
+            reportedIssue[key] = nil
+            return
+        end
+        if issue and reportedIssue[key] == issue then return end
+        if issue then
+            reportedIssue[key] = issue
+            nextWarning[key] = os.clock() + 5
+            log(key .. ": " .. text, true)
+            return
+        end
         if problem and os.clock() >= (nextWarning[key] or -math.huge) then
             nextWarning[key] = os.clock() + 5
             log(key .. ": " .. text, true)
@@ -398,8 +420,7 @@ engine = Core.new({
     end,
     leaveJobPad = function()
         local part = root()
-        deliveryHumanoid = part.Parent:FindFirstChildOfClass("Humanoid")
-        deliveryHumanoid:MoveTo(part.Position + part.CFrame.LookVector * 16)
+        beginDrive(part.Position + part.CFrame.LookVector * 16, "claimed", 6)
     end,
     moveToBoard = function()
         local geometry = workspace:FindFirstChild("ServerGeometry")
@@ -409,16 +430,20 @@ engine = Core.new({
         remote("ClaimJob")
         remote("ReportJobArrival")
         remote("CollectJob")
-        moveTo(board, 10, 3)
+        local target = location(board).Position
+        local distance = (root().Position - target).Magnitude
+        beginDrive(target, "idle", 6)
+        return distance <= 10, distance
     end,
     claimJob = function(tier, slot) send("ClaimJob", tier, slot) end,
-    moveToDrop = approachDelivery,
-    getDeliveryDiagnostics = deliveryDiagnostics,
-    walkToDrop = function(drop)
-        local part = root()
-        deliveryHumanoid = part.Parent:FindFirstChildOfClass("Humanoid")
-        deliveryHumanoid:MoveTo(location(drop).Position)
+    isAtBoard = function()
+        local geometry = workspace:FindFirstChild("ServerGeometry")
+        local board = workspace:FindFirstChild("JobsPart") or (geometry and geometry:FindFirstChild("JobsPart"))
+        return board ~= nil and (root().Position - location(board).Position).Magnitude <= 10
     end,
+    moveToDrop = function(drop) return beginDrive(location(drop).Position, "running") end,
+    sameDropPoint = function(first, second) return (location(first).Position - location(second).Position).Magnitude <= 2 end,
+    getDeliveryMovementProblem = function() return movementProblem end,
     getDropDistance = function(drop) return (root().Position - location(drop).Position).Magnitude end,
     stopDeliveryMovement = stopDeliveryMovement,
     reportArrival = function() send("ReportJobArrival") end,
@@ -765,6 +790,7 @@ connect(detectCount.Activated, function()
 end)
 paragraph(pages.Jobs, "At 10 ascensions, Hard pays 10,000. Locked tiers are skipped. If a claim is not confirmed, the hub waits instead of downgrading to Easy.", 108, 3)
 paragraph(pages.Jobs, "During deliveries, race reset and ascension wait so they cannot interrupt movement. Purchases can continue in the background.", 94, 4)
+paragraph(pages.Jobs, "Auto Jobs steers your character while travelling. Turn it off or press Stop all to steer manually. Blocked travel pauses and returns control to you.", 108, 5)
 
 heading(pages.Tools, "SET THE PACE", "Background tools", "Independent controls, spaced requests and clear feedback. Everything starts off except idle prevention.")
 toggle(pages.Tools, "race", "Repeat race reset", "Requests ResetRace every 4 seconds. This does not complete races.", 1, false)

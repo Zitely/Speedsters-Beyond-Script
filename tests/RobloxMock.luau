@@ -1,7 +1,8 @@
--- A deliberately small Roblox API double for wiring/lifecycle tests, not a game simulator.
+-- Small Roblox API double with optional momentum simulation from the supplied RunWorld snippet.
+-- Does not simulate the full game or server acceptance.
 local Mock = {}
 function Mock.new()
-    local mock = { shared = {}, clock = 0, calls = {}, connections = {}, warnings = {}, walks = {}, pivots = {}, streamRequests = {} }
+    local mock = { shared = {}, clock = 0, calls = {}, connections = {}, warnings = {}, walks = {}, pivots = {}, streamRequests = {}, moves = {}, bindings = {} }
     local function signal()
         local result = { listeners = {} }
         function result:Connect(callback)
@@ -111,6 +112,15 @@ function Mock.new()
         table.insert(mock.calls, { name = self.Name, args = args, time = mock.clock })
         if mock.onRemote then mock.onRemote(self.Name, args) end
     end
+    function methods:Move(direction, cameraRelative)
+        assert(cameraRelative == false)
+        self.MoveDirection = direction
+        table.insert(mock.moves, { direction = direction, time = mock.clock })
+    end
+    function methods:BindToRenderStep(name, priority, callback)
+        mock.bindings[name] = { priority = priority, callback = callback }
+    end
+    function methods:UnbindFromRenderStep(name) mock.bindings[name] = nil end
     function methods:MoveTo(position)
         self.WalkToPoint = position
         table.insert(mock.walks, { humanoid = self, position = position, time = mock.clock })
@@ -142,7 +152,7 @@ function Mock.new()
         return { Position = v(origin.X, ground, origin.Z), Normal = mock.groundNormal or v(0, 1, 0) }
     end
     local function instance(class, name, parent)
-        local item = setmetatable({ _props = { ClassName = class, Name = name or class, Visible = true, Position = size(0, 0, 0, 0), CFrame = cframe(), Health = 100, HipHeight = 2, Size = v(2, 2, 1), AssemblyLinearVelocity = v(0, 0, 0) }, _children = {}, _signals = {} }, instanceMt)
+        local item = setmetatable({ _props = { ClassName = class, Name = name or class, Visible = true, Position = size(0, 0, 0, 0), CFrame = cframe(), Health = 100, MoveDirection = v(0, 0, 0), WalkSpeed = 5000, HipHeight = 2, Size = v(2, 2, 1), AssemblyLinearVelocity = v(0, 0, 0) }, _children = {}, _signals = {} }, instanceMt)
         item.Parent = parent
         return item
     end
@@ -157,6 +167,10 @@ function Mock.new()
     instance("Part", "HumanoidRootPart", player.Character)
     instance("Humanoid", "Humanoid", player.Character)
     local scripts = instance("Folder", "PlayerScripts", player)
+    mock.controls = { controlsEnabled = true, enables = 0, disables = 0 }
+    function mock.controls:Enable() self.controlsEnabled = true; self.enables += 1 end
+    function mock.controls:Disable() self.controlsEnabled = false; self.disables += 1 end
+    instance("ModuleScript", "PlayerModule", scripts).value = { GetControls = function() return mock.controls end }
     local controllers = instance("Folder", "Controllers", scripts)
     local module = instance("ModuleScript", "JobsController", controllers)
     module.value = {
@@ -184,6 +198,25 @@ function Mock.new()
         rawset(self, key, group)
         return group
     end })
+    enum.RenderPriority = { Input = { Value = 100 }, Camera = { Value = 200 } }
+    -- Default controls also run at 100. Test both possible orders for equal priorities.
+    mock.bindings.DefaultControls = { priority = 100, callback = function()
+        local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+        if humanoid and mock.controls.controlsEnabled then humanoid:Move(mock.userDirection or v(0, 0, 0), false) end
+    end }
+    mock.bindings.SpeedstersMovement = { priority = 101, callback = function(dt)
+        if not mock.simulateMovement then return end
+        local character = player.Character
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        local part = character:FindFirstChild("HumanoidRootPart")
+        local direction = humanoid.MoveDirection
+        if direction.Magnitude <= 0.1 then
+            mock.ramp = 0
+        else
+            mock.ramp = math.min((mock.ramp or 0) + (mock.acceleration or 6000) * dt, humanoid.WalkSpeed)
+        end
+        part.AssemblyLinearVelocity = v(direction.X * mock.ramp, part.AssemblyLinearVelocity.Y, direction.Z * mock.ramp)
+    end }
     local env = setmetatable({
         game = { GetService = function(_, name) assert(services[name], name); return services[name] end },
         workspace = workspace, Instance = { new = instance }, Enum = enum,
@@ -223,9 +256,31 @@ function Mock.new()
         local titleLabel = mock.find(title, "TextLabel")
         titleLabel.Parent:FindFirstChildOfClass("TextButton").Activated:Fire()
     end
+    function mock.render(dt)
+        local ordered = {}
+        for name, binding in pairs(mock.bindings) do
+            table.insert(ordered, { name = name, priority = binding.priority, callback = binding.callback })
+        end
+        table.sort(ordered, function(a, b)
+            if a.priority ~= b.priority then return a.priority < b.priority end
+            if mock.reverseInputOrder then return a.name > b.name end
+            return a.name < b.name
+        end)
+        for _, binding in ipairs(ordered) do binding.callback(dt) end
+        if mock.simulateMovement then
+            local part = player.Character:FindFirstChild("HumanoidRootPart")
+            part.CFrame = part.CFrame + part.AssemblyLinearVelocity * dt
+        end
+    end
+    function mock.frame(dt)
+        mock.clock += dt
+        mock.render(dt)
+        services.RunService.Heartbeat:Fire(dt)
+    end
     function mock.tick(now)
         mock.clock = now
         services.RunService.Heartbeat:Fire(0.2)
+        mock.render(1/60)
     end
     return mock
 end
