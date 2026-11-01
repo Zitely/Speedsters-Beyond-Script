@@ -104,21 +104,6 @@ test("missing remotes surface in the UI and late remotes recover", function()
     assert(m.calls[1].name == "ChargeStart")
     s.destroy()
 end)
-test("job adapter loads controller, claims once, arrives then collects", function()
-    local m = Mock.new()
-    local s = m.load(BUNDLE)
-    m.toggle("Auto job & deliver"); m.tick(0); m.tick(1)
-    assert(#m.calls == 1 and m.calls[1].name == "ClaimJob")
-    m.drop = m.vector(100, 0, 0)
-    m.player.Character:FindFirstChild("HumanoidRootPart").CFrame = m.environment.CFrame.new(m.vector(80, 0, 0))
-    advance(m, 2, 4)
-    assert(#m.calls == 2 and m.calls[2].name == "ReportJobArrival")
-    m.drop = nil
-    advance(m, 4.5, 6.5)
-    assert(m.calls[3].name == "CollectJob" and s.engine.deliveries == 0)
-    advance(m, 7, 10); assert(s.engine.deliveries == 1)
-    s.destroy()
-end)
 test("orbs use distance, cooldowns, and streamed additions/removals", function()
     local m = Mock.new()
     local s = m.load(BUNDLE)
@@ -265,37 +250,15 @@ local function drive(m, target)
     return s
 end
 
-test("destination clearing on native arrival still collects without returning to board", function()
+test("a cleared marker without banked progress waits for the next destination", function()
     local m = Mock.new()
-    local s = m.load(BUNDLE)
-    m.toggle("Auto job & deliver"); m.tick(0); m.tick(1)
-    m.drop = m.vector(100, 0, 0)
-    place(m, 80)
-    m.tick(2)
+    local s = drive(m, m.vector(20, 0, 0))
+    m.legCount, m.phase = 4, "running"
+    advance(m, 0.5, 2)
     m.drop = nil
-    advance(m, 3, 7)
-    assert(root(m).Position.X == 80, "Character returned before collection settled")
-    assert(#m.calls == 3 and m.calls[3].name == "CollectJob")
-    advance(m, 7.5, 10.5); assert(s.engine.deliveries == 1)
-    s.destroy()
-end)
-test("late server arrival acceptance gates collection", function()
-    local m = Mock.new()
-    place(m, 80)
-    local s = drive(m, m.vector(100, 0, 0))
-    local acceptedAt
-    m.onRemote = function(name)
-        if name == "ReportJobArrival" and m.clock >= 6 then
-            acceptedAt = m.clock
-            m.drop = nil
-        elseif name == "CollectJob" then
-            assert(acceptedAt and m.clock - acceptedAt >= 1.5, "Payout requested before arrival was accepted")
-        end
-    end
-    advance(m, 0.5, 14)
-    assert(acceptedAt == 8 and s.engine.deliveries == 1)
-    assert(m.calls[1].time == 2 and m.calls[1].name == "ReportJobArrival")
-    assert(m.calls[4].name == "CollectJob")
+    advance(m, 2.5, 20)
+    for _, call in ipairs(m.calls) do assert(call.name == "ReportJobArrival") end
+    assert(s.engine.deliveries == 0 and m.controls.controlsEnabled)
     s.destroy()
 end)
 test("direction input precedes game movement regardless of default input tie order", function()
@@ -336,9 +299,14 @@ test("simulated game momentum reaches a 50000-stud delivery and brakes inside th
                 assert((root(m).Position - m.drop).Magnitude <= 50)
                 assert(root(m).AssemblyLinearVelocity.Magnitude == 0)
                 acceptedAt = m.clock
-                m.drop = nil
+                m.drop, m.banked, m.phase, m.delivered = nil, 1, "claimed", true
+            elseif name == "ReturnToSpawn" then
+                assert(m.banked == 1); place(m, 20)
+                m.player.Character:SetAttribute("PlayerState", "Main")
             elseif name == "CollectJob" then
-                assert(acceptedAt and m.clock - acceptedAt >= 1.5)
+                assert(acceptedAt and m.clock >= acceptedAt)
+                assert(root(m).Position.Magnitude <= 10)
+                m.banked, m.legCount, m.phase, m.delivered = 0, 0, "idle", false
             else
                 error("Unexpected new claim during delivery: " .. name)
             end
@@ -352,17 +320,19 @@ test("simulated game momentum reaches a 50000-stud delivery and brakes inside th
         s.destroy()
     end
 end)
-test("blocked movement pauses and logs once while its UI distance stays current", function()
+test("blocked movement retries a route automatically without claiming again", function()
     local m = Mock.new()
     local s = drive(m, m.vector(50000, 0, 0))
     advance(m, 0.5, 13)
-    assert(s.engine.jobs.movementBlocked and m.controls.controlsEnabled)
-    local warnings, disables = #m.warnings, m.controls.disables
-    for time = 13.5, 23, 0.5 do place(m, -time); m.tick(time) end
-    m.tick(23.5)
-    assert(#m.warnings == warnings and m.controls.disables == disables)
-    assert(string.find(s.engine.status.jobs.text, "50023", 1, true))
-    assert(s.engine.status.jobs.issue == "travel_stalled" and #m.calls == 0)
+    assert(s.engine.jobs.travel.retryAt and m.controls.controlsEnabled)
+    local warnings = #m.warnings
+    place(m, -20); advance(m, 13.5, 14.5)
+    assert(#m.warnings == warnings)
+    assert(string.find(s.engine.status.jobs.text, "50020", 1, true))
+    m.tick(15)
+    assert(#m.pathRequests == 1 and not m.controls.controlsEnabled)
+    assert((m.pathRequests[1].destination - m.pathRequests[1].origin).Magnitude <= 192.001)
+    assert(#m.calls == 0)
     s.destroy()
 end)
 test("turning off, stop all, switching modes and close restore user controls", function()
@@ -424,7 +394,7 @@ test("phase and world changes release steering immediately", function()
 end)
 test("claimed phase leaves the pad using input and ignores stale drop points", function()
     local m = Mock.new()
-    m.phase = "claimed"
+    m.phase, m.legCount = "claimed", 3
     local s = drive(m, m.vector(12920, 0, 0))
     assert(humanoid(m).MoveDirection.Z == -1 and humanoid(m).MoveDirection.X == 0)
     assert(#m.pivots == 0 and #m.calls == 0)
@@ -433,13 +403,15 @@ test("claimed phase leaves the pad using input and ignores stale drop points", f
     advance(m, 1, 3); assert(#m.calls == 0)
     s.destroy()
 end)
-test("a job stuck in claimed releases controls for a manual step off the pad", function()
+test("a job stuck in claimed automatically replans departure", function()
     local m = Mock.new()
-    m.phase = "claimed"
+    m.phase, m.legCount = "claimed", 3
     local s = drive(m, m.vector(12920, 0, 0))
-    advance(m, 0.5, 20)
+    advance(m, 0.5, 13)
     assert(m.controls.controlsEnabled and #m.calls == 0)
-    assert(s.engine.status.jobs.problem and string.find(s.engine.status.jobs.text, "step off", 1, true))
+    advance(m, 13.5, 20)
+    assert(#m.pathRequests >= 1 and not m.controls.controlsEnabled)
+    assert(m.pathRequests[1].destination.Z == -24 and #m.calls == 0)
     s.destroy()
 end)
 test("delivery waits for RunWorld before acquiring input", function()
@@ -454,24 +426,24 @@ test("delivery waits for RunWorld before acquiring input", function()
 end)
 test("idle ignores stale destinations and claiming waits for actual board proximity", function()
     local m = Mock.new()
-    m.phase = "idle"
+    m.phase, m.legCount = "idle", 0
     place(m, 1000)
     local s = drive(m, m.vector(12920, 0, 0))
-    advance(m, 0.5, 4)
-    assert(humanoid(m).MoveDirection.X == -1 and #m.calls == 0)
-    place(m, 5); m.tick(4.5); m.tick(5.5)
-    assert(#m.calls == 1 and m.calls[1].name == "ClaimJob")
-    assert(m.calls[1].args[1] == 3 and m.controls.controlsEnabled)
+    advance(m, 0.5, 6)
+    assert(humanoid(m).MoveDirection.X == -1 and #m.calls == 1)
+    assert(m.calls[1].name == "ReturnToSpawn")
+    place(m, 5); m.tick(6.5); m.tick(7.5)
+    assert(#m.calls == 2 and m.calls[2].name == "ClaimJob")
+    assert(m.calls[2].args[1] == 3 and m.controls.controlsEnabled)
     s.destroy()
 end)
 test("moving away from the board during the claim delay prevents a remote claim", function()
     local m = Mock.new()
     local s = m.load(BUNDLE)
     m.toggle("Auto job & deliver"); m.tick(0)
-    place(m, 500); m.tick(1); m.tick(1.5)
-    assert(#m.calls == 0 and humanoid(m).MoveDirection.X == -1)
-    advance(m, 2, 20)
-    assert(s.engine.jobs.boardPaused and m.controls.controlsEnabled and #m.calls == 0)
+    place(m, 500); advance(m, 1, 7)
+    assert(m.calls[1].name == "ReturnToSpawn" and #m.calls == 1)
+    assert(humanoid(m).MoveDirection.X == -1)
     s.destroy()
 end)
 test("new delivery waypoints reset arrival attempts and never start another claim", function()
@@ -481,12 +453,12 @@ test("new delivery waypoints reset arrival attempts and never start another clai
     assert(m.calls[1].name == "ReportJobArrival")
     m.drop = m.vector(-1000, 0, 0)
     m.tick(2.5)
-    assert(humanoid(m).MoveDirection.X == -1 and s.engine.jobs.arrivalAttempts == nil)
+    assert(humanoid(m).MoveDirection.X == -1 and s.engine.jobs.travel.attempts == 0)
     advance(m, 3, 6)
     assert(#m.calls == 1 and s.engine.deliveries == 0)
     s.destroy()
 end)
-test("unconfirmed arrival releases input and permits manual travel", function()
+test("unconfirmed arrival waits before retrying a closer approach automatically", function()
     local m = Mock.new()
     local s = drive(m, m.vector(20, 0, 0))
     advance(m, 0.5, 20)
@@ -494,6 +466,156 @@ test("unconfirmed arrival releases input and permits manual travel", function()
     local disables = m.controls.disables
     place(m, -100); advance(m, 20.5, 23)
     assert(m.controls.disables == disables and #m.calls == 5)
+    advance(m, 23.5, 25)
+    assert(#m.pathRequests >= 1 and not m.controls.controlsEnabled and #m.calls == 5)
     s.destroy()
+end)
+test("two complete four-job chains fill, deliver, return, collect and repeat without manual input", function()
+    local m = Mock.new()
+    m.player:SetAttribute("Ascensions", 25)
+    m.simulateMovement = true
+    m.legCount, m.banked, m.phase = 0, 0, "idle"
+    local claimCount, returns, payouts = 0, 0, 0
+    local destinations = { m.vector(500, 0, 0), m.vector(800, 0, 100), m.vector(1200, 0, -100), m.vector(2000, 0, 0) }
+    m.onRemote = function(name, args)
+        if name == "ClaimJob" then
+            assert(root(m).Position.Magnitude <= 10 and m.legCount < 4)
+            assert(args[1] == 9, "Did not choose the highest-paying eligible tier")
+            if m.legCount == 0 then assert(#args == 2 and args[2] == 2)
+            else assert(m.phase == "claimed" and #args == 1) end
+            claimCount += 1
+            m.legCount += 1
+            m.legIndex, m.phase, m.delivered = 1, "claimed", false
+        elseif name == "ReportJobArrival" then
+            assert(m.phase == "running" and (root(m).Position - m.drop).Magnitude <= 50)
+            m.banked += 1
+            if m.banked == 4 then
+                m.drop, m.phase, m.delivered = nil, "claimed", true
+            else
+                m.legIndex += 1
+                m.drop = destinations[m.legIndex]
+            end
+        elseif name == "ReturnToSpawn" then
+            assert(m.banked == 4, "Returned before the chain was complete")
+            returns += 1
+            place(m, 20)
+            m.player.Character:SetAttribute("PlayerState", "Main")
+        elseif name == "CollectJob" then
+            assert(m.banked == 4 and root(m).Position.Magnitude <= 10)
+            payouts += 1
+            m.legCount, m.banked, m.phase, m.delivered = 0, 0, "idle", false
+        else
+            error("Unexpected request: " .. name)
+        end
+    end
+    local s = m.load(BUNDLE)
+    m.toggle("Auto job & deliver")
+    for _ = 1, 90 * 60 do
+        m.frame(1/60)
+        if m.phase == "claimed" and m.legCount == 4 and m.banked == 0 and root(m).Position.Magnitude > 8 then
+            m.phase, m.drop = "running", destinations[1]
+            m.player.Character:SetAttribute("PlayerState", "RunWorld")
+        end
+        if s.engine.deliveries == 8 then break end
+    end
+    assert(s.engine.deliveries == 8, s.engine.status.jobs.text)
+    assert(claimCount == 8 and returns == 2 and payouts == 2)
+    assert(#m.pivots == 0 and #m.walks == 0)
+    s.destroy()
+end)
+test("route recovery follows a detour and issues native jump input", function()
+    local m = Mock.new()
+    m.pathWaypoints = function(origin, destination)
+        return {
+            { Position = origin },
+            { Position = origin + m.vector(0, 0, 10), Action = m.environment.Enum.PathWaypointAction.Jump },
+            { Position = destination },
+        }
+    end
+    local s = drive(m, m.vector(1000, 0, 0))
+    advance(m, 0.5, 15)
+    assert(#m.pathRequests == 1)
+    assert(humanoid(m).MoveDirection.X == 0 and humanoid(m).MoveDirection.Z == 1)
+    assert(humanoid(m).Jump == true)
+    m.paths[1].Blocked:Fire(2)
+    m.render(1/60)
+    assert(m.paths[1].destroyed and #m.pathRequests == 2)
+    s.destroy()
+end)
+test("a failed navigation query retries without manual input", function()
+    local m = Mock.new()
+    m.pathStatus = "PathStatus.NoPath"
+    local s = drive(m, m.vector(1000, 0, 0))
+    advance(m, 0.5, 15)
+    assert(humanoid(m).MoveDirection.Magnitude == 0 and #m.pathRequests == 1)
+    advance(m, 15.5, 17.5)
+    assert(#m.pathRequests == 1)
+    m.pathStatus = nil
+    m.tick(18)
+    assert(#m.pathRequests == 2 and humanoid(m).MoveDirection.X == 1)
+    s.destroy()
+end)
+test("stopping and changing destinations cancel pending navigation computations", function()
+    for _, action in ipairs({ "stop", "target", "close" }) do
+        local m = Mock.new()
+        m.pathYield = true
+        local s = drive(m, m.vector(1000, 0, 0))
+        advance(m, 0.5, 15)
+        local pending, path = m.pathThread, m.paths[1]
+        assert(coroutine.status(pending) == "suspended")
+        if action == "stop" then m.find("Stop all").Activated:Fire()
+        elseif action == "target" then m.drop = m.vector(0, 0, 1000); m.tick(15.5)
+        else s.destroy() end
+        assert(coroutine.status(pending) == "dead" and path.destroyed)
+        assert(not coroutine.resume(pending))
+        if action ~= "target" then assert(m.controls.controlsEnabled) end
+        s.destroy()
+    end
+end)
+test("new snapshot events cannot be overwritten by an older yielding snapshot request", function()
+    local m = Mock.new()
+    m.snapshotYield = true
+    local s = drive(m, m.vector(1000, 0, 0))
+    assert(s.engine.status.jobs.problem and #m.calls == 0)
+    m.legCount, m.phase, m.drop = 4, "claimed", nil
+    m.publishSnapshot()
+    assert(coroutine.resume(m.snapshotThread))
+    m.tick(1)
+    assert(s.engine.jobState.legCount == 4 and not s.engine.status.jobs.problem)
+    assert(#m.calls == 0)
+    s.destroy()
+end)
+test("closing cancels snapshot loading and preserves manual controls", function()
+    local m = Mock.new()
+    m.snapshotYield = true
+    local s = drive(m, m.vector(1000, 0, 0))
+    local pending = m.snapshotThread
+    s.destroy()
+    assert(coroutine.status(pending) == "dead" and m.controls.controlsEnabled)
+    assert(activeConnections(m) == 0)
+end)
+test("unacknowledged payout is never counted and uses fresh state before retry", function()
+    local m = Mock.new()
+    m.legCount, m.banked, m.legIndex, m.phase, m.delivered = 4, 4, 4, "claimed", true
+    local s = m.load(BUNDLE)
+    m.toggle("Auto job & deliver"); advance(m, 0, 9)
+    assert(#m.calls == 1 and m.calls[1].name == "CollectJob" and s.engine.deliveries == 0)
+    local snapshots = m.snapshotRequests
+    advance(m, 9.5, 11)
+    assert(m.snapshotRequests > snapshots and #m.calls == 2)
+    assert(s.engine.deliveries == 0 and m.calls[2].name == "CollectJob")
+    s.destroy()
+end)
+test("a timed-out navigation computation is canceled before replanning", function()
+    local m = Mock.new()
+    m.pathYield = true
+    local s = drive(m, m.vector(1000, 0, 0))
+    advance(m, 0.5, 15)
+    local first = m.pathThread
+    advance(m, 15.5, 23)
+    assert(coroutine.status(first) == "dead" and m.paths[1].destroyed)
+    assert(#m.pathRequests == 2 and coroutine.status(m.pathThread) == "suspended")
+    s.destroy()
+    assert(coroutine.status(m.pathThread) == "dead")
 end)
 print(string.format("%d UI/adapter tests passed (mock Roblox API)", passed))

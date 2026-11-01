@@ -2,7 +2,7 @@
 -- Does not simulate the full game or server acceptance.
 local Mock = {}
 function Mock.new()
-    local mock = { shared = {}, clock = 0, calls = {}, connections = {}, warnings = {}, walks = {}, pivots = {}, streamRequests = {}, moves = {}, bindings = {} }
+    local mock = { shared = {}, clock = 0, calls = {}, connections = {}, warnings = {}, walks = {}, pivots = {}, streamRequests = {}, moves = {}, bindings = {}, pathRequests = {}, paths = {}, snapshotRequests = 0 }
     local function signal()
         local result = { listeners = {} }
         function result:Connect(callback)
@@ -33,7 +33,7 @@ function Mock.new()
     local function cframe(value) return setmetatable({ Position = value or v(0, 0, 0), kind = "CFrame" }, cf) end
     local function udim(scale, offset) return { Scale = scale, Offset = offset } end
     local function size(xs, xo, ys, yo) return { X = udim(xs, xo), Y = udim(ys, yo) } end
-    local eventNames = { Activated = true, MouseEnter = true, MouseLeave = true, InputBegan = true, InputChanged = true, InputEnded = true, Idled = true, CharacterAdded = true, DescendantAdded = true, DescendantRemoving = true, Heartbeat = true, Destroying = true, Event = true }
+    local eventNames = { Activated = true, MouseEnter = true, MouseLeave = true, InputBegan = true, InputChanged = true, InputEnded = true, Idled = true, CharacterAdded = true, OnClientEvent = true, DescendantAdded = true, DescendantRemoving = true, Heartbeat = true, Destroying = true, Event = true }
     local methods = {}
     local instanceMt = {}
     instanceMt.__index = function(self, key)
@@ -107,6 +107,13 @@ function Mock.new()
         self.Parent = nil
     end
     function methods:Fire(...) self.Event:Fire(...) end
+    function methods:InvokeServer()
+        assert(self.Name == "GetJobsSnapshot")
+        mock.snapshotRequests += 1
+        local snapshot = mock.snapshot()
+        if mock.snapshotYield then mock.snapshotThread = coroutine.running(); coroutine.yield() end
+        return snapshot
+    end
     function methods:FireServer(...)
         local args = { ... }
         table.insert(mock.calls, { name = self.Name, args = args, time = mock.clock })
@@ -173,13 +180,25 @@ function Mock.new()
     instance("ModuleScript", "PlayerModule", scripts).value = { GetControls = function() return mock.controls end }
     local controllers = instance("Folder", "Controllers", scripts)
     local module = instance("ModuleScript", "JobsController", controllers)
+    local function legCount() return mock.legCount or ((mock.drop or mock.phase == "claimed" or (mock.banked or 0) > 0) and 1 or 0) end
+    local function phase() return mock.phase or (mock.drop and "running" or ((mock.banked or 0) > 0 and "claimed" or "idle")) end
+    function mock.snapshot()
+        local count = legCount()
+        local legs = {}
+        for i = 1, count do legs[i] = { tier = 3, jobType = 1, dropPoint = mock.drop } end
+        return { banked = mock.banked or 0, contract = count > 0 and { index = mock.legIndex or 1, legs = legs } or nil }
+    end
     module.value = {
+        GetLegCount = legCount,
+        GetBankedCount = function() return mock.banked or 0 end,
+        HasDeliveredCurrent = function() return mock.delivered == true end,
         GetDropPoint = function() return mock.drop end,
-        GetPhase = function() return mock.phase or (mock.drop and "running" or "idle") end,
+        GetPhase = phase,
     }
     local replicated = instance("ReplicatedStorage")
     local remotes = instance("Folder", "Remotes", replicated)
-    for _, name in ipairs({ "ChargeStart", "ChargeBurst", "ClaimJob", "ReportJobArrival", "CollectJob", "OrbCollect", "ResetRace", "AscendRequest", "BuyUpgrade" }) do instance("RemoteEvent", name, remotes) end
+    for _, name in ipairs({ "ReturnToSpawn", "JobsStateChanged", "ChargeStart", "ChargeBurst", "ClaimJob", "ReportJobArrival", "CollectJob", "OrbCollect", "ResetRace", "AscendRequest", "BuyUpgrade" }) do instance("RemoteEvent", name, remotes) end
+    instance("RemoteFunction", "GetJobsSnapshot", remotes)
     local treadmills = instance("Folder", "Treadmills", workspace)
     instance("Part", "x10", treadmills)
     instance("Model", "x20", treadmills)
@@ -192,6 +211,23 @@ function Mock.new()
             return { Cancel = function() end, Play = function() for k, value in pairs(props) do object[k] = value end end }
         end },
     }
+    services.PathfindingService = { CreatePath = function(_, options)
+        local path = { Blocked = signal(), options = options }
+        table.insert(mock.paths, path)
+        function path:ComputeAsync(origin, destination)
+            self.origin, self.destination = origin, destination
+            table.insert(mock.pathRequests, { origin = origin, destination = destination, time = mock.clock })
+            if mock.pathYield then mock.pathThread = coroutine.running(); coroutine.yield() end
+            if mock.pathError then error(mock.pathError) end
+            self.Status = mock.pathStatus or "PathStatus.Success"
+        end
+        function path:GetWaypoints()
+            if mock.pathWaypoints then return mock.pathWaypoints(self.origin, self.destination) end
+            return { { Position = self.origin }, { Position = self.destination } }
+        end
+        function path:Destroy() self.destroyed = true end
+        return path
+    end }
     function services.UserInputService:GetFocusedTextBox() return nil end
     local enum = setmetatable({}, { __index = function(self, key)
         local group = setmetatable({}, { __index = function(_, member) return key .. "." .. member end })
@@ -272,13 +308,23 @@ function Mock.new()
             part.CFrame = part.CFrame + part.AssemblyLinearVelocity * dt
         end
     end
+    function mock.publishSnapshot()
+        local snapshot = mock.snapshot()
+        local key = tostring(legCount()) .. ":" .. tostring(mock.banked or 0) .. ":" .. tostring(mock.legIndex or 1)
+        if key ~= mock.lastSnapshotKey then
+            mock.lastSnapshotKey = key
+            remotes:FindFirstChild("JobsStateChanged").OnClientEvent:Fire(snapshot)
+        end
+    end
     function mock.frame(dt)
         mock.clock += dt
         mock.render(dt)
+        mock.publishSnapshot()
         services.RunService.Heartbeat:Fire(dt)
     end
     function mock.tick(now)
         mock.clock = now
+        mock.publishSnapshot()
         services.RunService.Heartbeat:Fire(0.2)
         mock.render(1/60)
     end

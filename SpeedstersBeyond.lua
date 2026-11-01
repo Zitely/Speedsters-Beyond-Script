@@ -5,9 +5,10 @@ local Core = {}
 Core.__index = Core
 Core.ARRIVAL_RADIUS = 50
 Core.ARRIVAL_SETTLE = 1.5
-Core.ARRIVAL_CLEAR = 1.5
 Core.ARRIVAL_RETRY = 3
 Core.ARRIVAL_ATTEMPTS = 5
+Core.RECOVERY_DELAY = 3
+Core.ARRIVAL_RECOVERY_DELAY = 10
 
 -- Reward/eligibility data supplied from JobsConfig / JobRewards (2026-10-31).
 Core.JOBS = {
@@ -108,9 +109,7 @@ function Core:run(key, statusKey, now, callback)
         if statusKey == "jobs" then
             self.adapter.stopDeliveryMovement()
             -- An unreadable sample is not evidence of continuous proximity/completion.
-            self.jobs.withinSince = nil
-            self.jobs.arrivalClearSince = nil
-            self.jobs.clearSince = nil
+            if self.jobs.travel then self.jobs.travel.withinSince = nil end
         end
         local failures = (self.failures[key] or 0) + 1
         self.failures[key] = failures
@@ -120,216 +119,300 @@ function Core:run(key, statusKey, now, callback)
     end
 end
 
+function Core:recoverMovement(phase, drop)
+    if self.adapter.recoverJobMovement then
+        self.adapter.recoverJobMovement(phase, drop)
+    elseif phase == "running" then
+        self.adapter.moveToDrop(drop)
+    elseif phase == "claimed" then
+        self.adapter.leaveJobPad()
+    else
+        self.adapter.moveToBoard()
+    end
+end
+
+local function recoveryDelay(attempts)
+    return math.min(30, Core.RECOVERY_DELAY * 2 ^ math.min(attempts or 0, 4))
+end
+
+function Core:travelToBoard(now, job, gamePhase)
+    if job.boardPaused then
+        if now < job.boardRetryAt then
+            self:report("jobs", "Board travel stalled · retrying automatically", true, "board_stalled")
+            return false
+        end
+        job.boardRecoveries = (job.boardRecoveries or 0) + 1
+        job.boardPaused = nil
+        job.bestBoardDistance = nil
+        job.boardProgressAt = now
+        job.spawnRequested = nil
+        job.spawnFinished = nil
+        self:recoverMovement("idle")
+    end
+    if self.adapter.shouldReturnToSpawn and self.adapter.shouldReturnToSpawn() and not job.spawnRequested then
+        self.adapter.stopDeliveryMovement()
+        self.adapter.returnToSpawn()
+        job.spawnRequested = now
+        self:report("jobs", "Return to Spawn requested · waiting for the game")
+        return false
+    end
+    if job.spawnRequested and not job.spawnFinished then
+        if not self.adapter.hasReturnedToSpawn() and now - job.spawnRequested < 5 then
+            self:report("jobs", "Waiting for Return to Spawn")
+            return false
+        end
+        -- A missing acknowledgement must not deadlock travel; approach normally after the grace period.
+        job.spawnFinished = true
+        job.boardProgressAt = now
+        job.bestBoardDistance = nil
+    end
+    local reached, distance = self.adapter.moveToBoard(gamePhase)
+    if reached ~= false then return true end
+    job.bestBoardDistance = job.bestBoardDistance or distance
+    job.boardProgressAt = job.boardProgressAt or now
+    if distance < job.bestBoardDistance - 2 then
+        job.bestBoardDistance = distance
+        job.boardProgressAt = now
+    end
+    if now - job.boardProgressAt >= 12 then
+        self.adapter.stopDeliveryMovement()
+        job.boardPaused = true
+        job.boardRetryAt = now + recoveryDelay(job.boardRecoveries)
+    end
+    self:report("jobs", string.format("Travelling to job board · %.0f studs remaining", distance))
+    return false
+end
+
+function Core.chainCapacity(ascensions)
+    Core.bestJob(ascensions) -- Reuse finite, whole-number validation.
+    if ascensions >= 25 then return 4 end
+    if ascensions >= 10 then return 3 end
+    return 2
+end
+
 function Core:stepJobs(now)
     local job = self.jobs
-    local gamePhase = self.adapter.getJobPhase and self.adapter.getJobPhase()
-    local drop
-    if gamePhase == nil or gamePhase == "running" then drop = self.adapter.getDropPoint() end
-    -- The game's DeliveryAutoLockController only uses GetDropPoint in "running".
-    -- A claimed contract must leave its pad before following its live target.
-    if gamePhase == "claimed" then
+    local state = self.adapter.getJobState()
+    assert(type(state) == "table" and (state.phase == "idle" or state.phase == "claimed" or state.phase == "running"), "Waiting for a valid job phase")
+    for _, key in ipairs({ "legCount", "banked", "index", "revision" }) do
+        local value = state[key]
+        assert(type(value) == "number" and value >= 0 and value < math.huge and value % 1 == 0, "Invalid job state: " .. key)
+    end
+    assert(state.legCount <= 4 and state.index <= state.legCount + 1, "Invalid job chain")
+    assert(type(state.delivered) == "boolean", "Delivery acknowledgement unavailable")
+    assert(state.phase ~= "running" or state.legCount > 0 and state.index >= 1, "Waiting for the active chain index")
+    self.jobState = state
+
+    local pending = job.pendingClaim
+    if pending and (state.legCount > pending.before or state.phase == "running") then
+        job.pendingClaim = nil
+        job.claimReadyAt = nil
+    end
+    if job.pendingCollect and state.banked < job.pendingCollect.before then
+        self.deliveries = self.deliveries + job.pendingCollect.before - state.banked
+        self.adapter.stopDeliveryMovement()
+        self.jobs = { phase = "idle" }
+        self:report("jobs", "Banked jobs collected · preparing the next chain")
+        return 1
+    end
+
+    -- A missing marker is not completion. Only banked progress can authorize the return trip.
+    local complete = state.banked > 0 and (state.legCount == 0 or state.index >= state.legCount
+        and (state.delivered or state.banked >= state.legCount))
+    if complete then
+        if job.phase ~= "collect" then
+            self.adapter.stopDeliveryMovement()
+            self.jobs = { phase = "collect" }
+            job = self.jobs
+        end
+        if job.pendingCollect then
+            if now < job.pendingCollect.retryAt then
+                self:report("jobs", "Payout requested · waiting for banked count to update")
+                return 0.5
+            end
+            if not job.pendingCollect.refreshRevision then
+                job.pendingCollect.refreshRevision = state.revision
+                self.adapter.refreshJobState()
+                self:report("jobs", "Refreshing payout state before retrying")
+                return 0.5
+            end
+            if state.revision <= job.pendingCollect.refreshRevision then
+                self.adapter.refreshJobState()
+                return 1
+            end
+        end
+        if not self:travelToBoard(now, job, state.phase) then return 0.3 end
+        self.adapter.collectJob()
+        self.adapter.stopDeliveryMovement()
+        job.collections = (job.collections or 0) + 1
+        job.pendingCollect = { before = state.banked, retryAt = now + math.max(10, recoveryDelay(job.collections)) }
+        self:report("jobs", string.format("Collecting %d banked jobs at the NPC", state.banked))
+        return 0.5
+    end
+    if job.pendingCollect then
+        self.adapter.stopDeliveryMovement()
+        self.adapter.refreshJobState()
+        self:report("jobs", "Payout state changed · synchronizing the active chain")
+        return 1
+    end
+
+    if state.phase == "idle" or state.phase == "claimed" and state.banked == 0 then
+        local ascensions = self.adapter.getAscensions()
+        local capacity = Core.chainCapacity(ascensions)
+        self.jobCapacity = capacity
+        if state.legCount < capacity then
+            pending = job.pendingClaim
+            if pending then
+                if now < pending.deadline then
+                    self:report("jobs", string.format("%d/%d jobs accepted · waiting for slot %d", state.legCount, capacity, pending.before + 1))
+                    return 0.3
+                end
+                if not pending.refreshRevision then
+                    pending.refreshRevision = state.revision
+                    self.adapter.refreshJobState()
+                    self:report("jobs", "Claim delayed · refreshing accepted slots before retrying")
+                    return 0.5
+                end
+                if state.revision <= pending.refreshRevision then
+                    self.adapter.refreshJobState()
+                    return 1
+                end
+                job.pendingClaim = nil
+                job.claimReadyAt = now + 3
+                self:report("jobs", "Slot still empty · retrying the best eligible job in 3s")
+                return 0.5
+            end
+            if not self:travelToBoard(now, job, state.phase) then return 0.3 end
+            job.claimReadyAt = job.claimReadyAt or now + 0.8
+            if now < job.claimReadyAt then
+                self:report("jobs", string.format("At board · filling %d available slots", capacity))
+                return 0.3
+            end
+            if not self.adapter.isAtBoard() then job.claimReadyAt = nil; return 0.3 end
+            local candidate = Core.bestJob(self.adapter.getAscensions())
+            if state.legCount == 0 and state.phase == "idle" then
+                self.adapter.claimJob(candidate.tier, candidate.jobType)
+            elseif state.phase == "claimed" then
+                -- The supplied append handler accepts the tier only.
+                self.adapter.appendJob(candidate.tier)
+            else
+                self:report("jobs", "Waiting for the board to accept another leg")
+                return 0.5
+            end
+            self.adapter.stopDeliveryMovement()
+            job.phase = "filling"
+            job.pendingClaim = { before = state.legCount, deadline = now + 12 }
+            self:report("jobs", string.format("Requested %s · slot %d/%d", candidate.name, state.legCount + 1, capacity))
+            return 0.3
+        end
+    end
+
+    if state.phase == "claimed" then
         job.phase = "leavePad"
         job.leaveStarted = job.leaveStarted or now
         if now - job.leaveStarted >= 12 then
-            if not job.leavePaused then self.adapter.stopDeliveryMovement(); job.leavePaused = true end
-            self:report("jobs", "Job still claimed · step off the job pad manually to start running", true)
-            return 1
+            if not job.leaveRetryAt then
+                self.adapter.stopDeliveryMovement()
+                job.leaveRetryAt = now + recoveryDelay(job.leaveRecoveries)
+            end
+            if now < job.leaveRetryAt then
+                self:report("jobs", "Departure stalled · retrying automatically", true, "leave_recovery")
+                return 0.5
+            end
+            self:recoverMovement("claimed")
+            job.leaveRecoveries = (job.leaveRecoveries or 0) + 1
+            job.leaveRetryAt = nil
+            job.leaveStarted = now
+            job.nextLeave = now + 12
         end
         if now >= (job.nextLeave or 0) then
             self.adapter.leaveJobPad()
             job.nextLeave = now + 4
         end
-        self:report("jobs", "Job claimed · leaving pad normally; waiting for running phase")
+        self:report("jobs", string.format("%d jobs accepted · leaving the board", state.legCount))
         return 0.5
     end
-    if job.phase == "leavePad" then
+    if state.phase ~= "running" then
         self.adapter.stopDeliveryMovement()
-        self.jobs = { phase = "idle" }
-        job = self.jobs
+        self.adapter.refreshJobState()
+        self:report("jobs", "Synchronizing job chain")
+        return 1
     end
-    if gamePhase ~= nil and gamePhase ~= "running" then drop = nil end
-    if gamePhase == "running" and self.adapter.getPlayerState then
-        local playerState = self.adapter.getPlayerState()
-        if playerState ~= "RunWorld" then
-            if not job.worldPaused then self.adapter.stopDeliveryMovement(); job.worldPaused = true end
-            job.withinSince = nil
-            job.arrivalClearSince = nil
-            job.clearSince = nil
-            self:report("jobs", "Waiting for running world before delivery movement")
-            return 0.5
-        end
-        job.worldPaused = nil
-    end
-    if drop ~= nil then
-        if job.lastDrop and self.adapter.sameDropPoint and not self.adapter.sameDropPoint(job.lastDrop, drop) then
-            self.adapter.stopDeliveryMovement()
-            self.jobs = { phase = "idle", choice = job.choice }
-            job = self.jobs
-        end
-        job.lastDrop = drop
-    end
-
-    if job.phase == "approach" or job.phase == "awaitArrival" then
-        -- A game-side completion can move the player too. Once arrival was reported,
-        -- observe a cleared destination before moving toward another destination.
-        if job.phase == "awaitArrival" and drop == nil then
-            job.arrivalClearSince = job.arrivalClearSince or now
-            if now - job.arrivalClearSince >= Core.ARRIVAL_CLEAR then
-                job.phase = "collect"
-                self:report("jobs", "Destination cleared · ready to collect banked payout")
-            else
-                self:report("jobs", "Destination cleared · checking it stays cleared")
-            end
-            return 0.3
-        end
-        job.arrivalClearSince = nil
-        local distance = self.adapter.getDropDistance(job.lastDrop)
-        assert(type(distance) == "number" and distance >= 0 and distance < math.huge, "Delivery distance unavailable")
-        local attempts = job.arrivalAttempts or 0
-        local detail = string.format("%.1f / %d studs · arrival %d/%d", distance, Core.ARRIVAL_RADIUS, attempts, Core.ARRIVAL_ATTEMPTS)
-
-        if attempts >= Core.ARRIVAL_ATTEMPTS then
-            if not job.arrivalPaused then self.adapter.stopDeliveryMovement(); job.arrivalPaused = true end
-            self:report("jobs", "Arrival unconfirmed · " .. detail .. " · try walking to marker", true)
-            return 0.5
-        end
-
-        if distance > Core.ARRIVAL_RADIUS then
-            job.withinSince = nil
-            job.arrivalClearSince = nil
-            job.bestTravelDistance = job.bestTravelDistance or distance
-            job.lastTravelProgress = job.lastTravelProgress or now
-            if distance < job.bestTravelDistance - 2 then
-                job.bestTravelDistance = distance
-                job.lastTravelProgress = now
-            end
-            if not job.movementBlocked and now - job.lastTravelProgress >= 12 then
-                self.adapter.stopDeliveryMovement()
-                job.movementBlocked = true
-            end
-            if job.movementBlocked then
-                self:report("jobs", string.format("Running input stalled · %.0f studs away · travel paused", distance), true, "travel_stalled")
-                return 1
-            end
-            self.adapter.moveToDrop(job.lastDrop)
-            local problem = self.adapter.getDeliveryMovementProblem and self.adapter.getDeliveryMovementProblem()
-            self:report("jobs", problem or string.format("Steering through game movement · %.0f studs to delivery", distance), problem ~= nil)
-            return 0.3
-        end
-        job.movementBlocked = nil
-        job.withinSince = job.withinSince or now
-        if now - job.withinSince < Core.ARRIVAL_SETTLE then
-            self:report("jobs", "Letting position settle · " .. detail)
-            return 0.3
-        end
-
-        if now >= (job.nextArrival or 0) then
-            self.adapter.reportArrival()
-            job.arrivalAttempts = attempts + 1
-            job.nextArrival = now + Core.ARRIVAL_RETRY
-            job.phase = "awaitArrival"
-            self:report("jobs", string.format("Arrival sent · %.1f / %d studs · attempt %d/%d; awaiting game", distance, Core.ARRIVAL_RADIUS, job.arrivalAttempts, Core.ARRIVAL_ATTEMPTS))
-        else
-            self:report("jobs", "Awaiting arrival · " .. detail)
-        end
-        return 0.3
-    elseif job.phase == "collect" then
-        if drop ~= nil then
-            job.phase = "awaitArrival"
-            job.arrivalClearSince = nil
-            self:report("jobs", "Destination active again · waiting for arrival acceptance")
-            return 0.3
-        end
-        if (job.collections or 0) >= 3 then
-            self:report("jobs", "Payout state keeps changing · holding delivery; restart Jobs to retry", true)
-            return 1
-        end
-        self.adapter.collectJob()
-        job.collections = (job.collections or 0) + 1
-        job.phase = "confirm"
-        job.clearSince = nil
-        self:report("jobs", "Payout requested · confirming delivery cleared")
-        return 0.3
-    elseif job.phase == "confirm" then
-        if drop == nil then
-            job.clearSince = job.clearSince or now
-            if now - job.clearSince >= 3 then
-                self.adapter.stopDeliveryMovement()
-                self.deliveries = self.deliveries + 1
-                self.jobs = { phase = "idle" }
-                self:report("jobs", "Delivery cleared · next job in 2s")
-                return 2
-            end
-            self:report("jobs", "Confirming delivery cleared · staying at destination")
-        else
-            job.clearSince = nil
-            job.arrivalClearSince = nil
-            job.phase = "awaitArrival"
-            self:report("jobs", "Destination active again · holding this delivery")
-        end
-        return 0.3
-    end
-
-    if drop ~= nil then
-        local moved, message, problem = self.adapter.moveToDrop(drop)
-        if moved == false then
-            self:report("jobs", message, problem)
-            return 0.5
-        end
-        job.phase = "approach"
-        job.bestTravelDistance = self.adapter.getDropDistance(drop)
-        job.lastTravelProgress = now
-        self:report("jobs", "Approaching delivery · waiting for position to settle")
-        return 0.3
-    end
-    if job.phase == "waiting" then
-        if now >= job.deadline then
-            self:report("jobs", "Claim not confirmed · waiting; restart Jobs to retry", true)
-        end
-        -- A timeout is not a rejection. Never downgrade or send another claim blindly.
-        return 0.3
-    end
-    if gamePhase ~= nil and gamePhase ~= "idle" then
-        self:report("jobs", "Game job phase: " .. tostring(gamePhase) .. " · waiting before a new claim")
+    if self.adapter.getPlayerState() ~= "RunWorld" then
+        self.adapter.stopDeliveryMovement()
+        if job.travel then job.travel.withinSince = nil end
+        self:report("jobs", "Waiting for running world")
         return 0.5
     end
-
-    local candidate = Core.bestJob(self.adapter.getAscensions())
-    if job.phase ~= "claim" then
-        if job.boardPaused then
-            self:report("jobs", "Travel to job board stalled · restart Jobs after reaching the board", true, "board_stalled")
-            return 1
-        end
-        local reached, distance = self.adapter.moveToBoard()
-        if reached == false then
-            job.bestBoardDistance = job.bestBoardDistance or distance
-            job.boardProgressAt = job.boardProgressAt or now
-            if distance < job.bestBoardDistance - 2 then
-                job.bestBoardDistance = distance
-                job.boardProgressAt = now
-            end
-            if now - job.boardProgressAt >= 12 then
-                self.adapter.stopDeliveryMovement()
-                job.boardPaused = true
-            end
-            self:report("jobs", string.format("Travelling to job board · %.0f studs remaining", distance))
-            return 0.3
-        end
-        job.phase = "claim"
-        self:report("jobs", "At board · selected " .. candidate.name .. " (" .. candidate.reward .. ")")
-        return 0.8
+    if state.delivered or not state.drop then
+        self.adapter.stopDeliveryMovement()
+        job.travel = nil
+        if now >= (job.nextRefresh or 0) then self.adapter.refreshJobState(); job.nextRefresh = now + 5 end
+        self:report("jobs", string.format("%d jobs banked · waiting for the next destination", state.banked))
+        return 0.5
     end
-    -- Recheck eligibility immediately before the request; ascension may have changed.
-    if self.adapter.isAtBoard and not self.adapter.isAtBoard() then
-        job.phase = "idle"
+    job.phase = "delivery"
+    local travel = job.travel
+    if not travel or travel.index ~= state.index or not self.adapter.sameDropPoint(travel.drop, state.drop) then
+        self.adapter.stopDeliveryMovement()
+        travel = { index = state.index, drop = state.drop, lastProgress = now, attempts = 0 }
+        job.travel = travel
+        self.adapter.moveToDrop(state.drop)
+    end
+    local distance = self.adapter.getDropDistance(state.drop)
+    assert(type(distance) == "number" and distance >= 0 and distance < math.huge, "Delivery distance unavailable")
+    if travel.attempts >= Core.ARRIVAL_ATTEMPTS then
+        if not travel.arrivalRetryAt then
+            self.adapter.stopDeliveryMovement()
+            travel.arrivalRetryAt = now + Core.ARRIVAL_RECOVERY_DELAY
+        end
+        if now < travel.arrivalRetryAt then
+            self:report("jobs", "Arrival not acknowledged · retrying approach automatically", true, "arrival_recovery")
+            return 0.5
+        end
+        self:recoverMovement("running", state.drop)
+        travel.attempts, travel.arrivalRetryAt, travel.withinSince, travel.nextArrival = 0, nil, nil, nil
+        travel.lastProgress, travel.bestDistance = now, distance
+        self:report("jobs", "Approaching marker again before retrying arrival")
         return 0.3
     end
-    self.adapter.claimJob(candidate.tier, candidate.jobType)
-    self.adapter.stopDeliveryMovement()
-    job.choice = candidate
-    job.phase = "waiting"
-    job.deadline = now + 12
-    self:report("jobs", "Requested " .. candidate.name .. " · waiting for acceptance")
+    if distance > Core.ARRIVAL_RADIUS then
+        travel.withinSince = nil
+        travel.bestDistance = travel.bestDistance or distance
+        if distance < travel.bestDistance - 2 then
+            travel.bestDistance, travel.lastProgress = distance, now
+        end
+        if not travel.retryAt and now - travel.lastProgress >= 12 then
+            self.adapter.stopDeliveryMovement()
+            travel.retryAt = now + recoveryDelay(travel.recoveries)
+        end
+        if travel.retryAt then
+            if now < travel.retryAt then
+                self:report("jobs", string.format("Travel stalled · %.0f studs away · automatic route retry pending", distance), true, "travel_stalled")
+                return 0.5
+            end
+            self:recoverMovement("running", state.drop)
+            travel.recoveries = (travel.recoveries or 0) + 1
+            travel.retryAt, travel.bestDistance, travel.lastProgress = nil, distance, now
+        else
+            self.adapter.moveToDrop(state.drop)
+        end
+        local problem = self.adapter.getDeliveryMovementProblem and self.adapter.getDeliveryMovementProblem()
+        self:report("jobs", problem or string.format("Leg %d/%d · %.0f studs to delivery", state.index, state.legCount, distance), problem ~= nil)
+        return 0.3
+    end
+    travel.retryAt = nil
+    travel.withinSince = travel.withinSince or now
+    if now - travel.withinSince < Core.ARRIVAL_SETTLE then
+        self:report("jobs", string.format("Leg %d/%d · settling inside delivery radius", state.index, state.legCount))
+        return 0.3
+    end
+    if now >= (travel.nextArrival or 0) then
+        self.adapter.reportArrival()
+        travel.attempts = travel.attempts + 1
+        travel.nextArrival = now + Core.ARRIVAL_RETRY
+    end
+    self:report("jobs", string.format("Leg %d/%d · arrival %d/%d sent; awaiting banked progress", state.index, state.legCount, travel.attempts, Core.ARRIVAL_ATTEMPTS))
     return 0.3
 end
 
@@ -469,6 +552,7 @@ function session.destroy()
     if not session.alive then return end
     session.alive = false
     if engine then engine:destroy() end
+    if session.cancelJobSnapshot then session.cancelJobSnapshot() end
     for _, name in ipairs(session.renderBindings) do RunService:UnbindFromRenderStep(name) end
     for _, connection in ipairs(session.connections) do connection:Disconnect() end
     for _, thread in ipairs(session.threads) do
@@ -627,6 +711,94 @@ local function jobsController()
     error(current.failure or "Loading JobsController", 0)
 end
 
+local jobSnapshots = { revision = 0, nextRequest = 0 }
+local function cancelSnapshotRequest()
+    local thread = jobSnapshots.thread
+    jobSnapshots.thread = nil
+    jobSnapshots.loading = false
+    if thread and coroutine.status(thread) ~= "dead" then pcall(task.cancel, thread) end
+end
+session.cancelJobSnapshot = cancelSnapshotRequest
+local function adoptJobSnapshot(snapshot)
+    if type(snapshot) ~= "table" or type(snapshot.banked) ~= "number" then
+        jobSnapshots.failure = "Invalid jobs snapshot"
+        jobSnapshots.value = nil
+        return
+    end
+    local contract = snapshot.contract
+    if contract ~= nil and contract ~= false and (type(contract) ~= "table" or type(contract.legs) ~= "table" or type(contract.index) ~= "number") then
+        jobSnapshots.failure = "Job chain snapshot is incomplete"
+        jobSnapshots.value = nil
+        return
+    end
+    jobSnapshots.value = {
+        legCount = contract and #contract.legs or 0,
+        index = contract and contract.index or 0,
+        banked = snapshot.banked,
+    }
+    jobSnapshots.revision = jobSnapshots.revision + 1
+    jobSnapshots.failure = nil
+end
+local function watchJobSnapshots()
+    local event = remote("JobsStateChanged")
+    if jobSnapshots.event ~= event then
+        cancelSnapshotRequest()
+        if jobSnapshots.connection then jobSnapshots.connection:Disconnect() end
+        jobSnapshots.event = event
+        jobSnapshots.value = nil
+        jobSnapshots.nextRequest = 0
+        jobSnapshots.connection = connect(event.OnClientEvent, adoptJobSnapshot)
+    end
+end
+local function refreshJobState()
+    jobsController()
+    watchJobSnapshots()
+    if jobSnapshots.loading and os.clock() - jobSnapshots.started >= 8 then
+        cancelSnapshotRequest()
+        jobSnapshots.nextRequest = os.clock() + 3
+    end
+    if jobSnapshots.loading or os.clock() < jobSnapshots.nextRequest then return end
+    local folder = ReplicatedStorage:FindFirstChild("Remotes")
+    local request = folder and folder:FindFirstChild("GetJobsSnapshot")
+    assert(request and request:IsA("RemoteFunction"), "Missing RemoteFunction: GetJobsSnapshot")
+    local revision, event = jobSnapshots.revision, jobSnapshots.event
+    jobSnapshots.loading = true
+    jobSnapshots.started = os.clock()
+    jobSnapshots.thread = task.spawn(function()
+        local loaded, snapshot = pcall(function() return request:InvokeServer() end)
+        if not session.alive or jobSnapshots.event ~= event then return end
+        jobSnapshots.loading = false
+        jobSnapshots.nextRequest = os.clock() + 2
+        -- An event received while InvokeServer yielded is newer than that request's view.
+        if revision ~= jobSnapshots.revision then return end
+        if loaded then adoptJobSnapshot(snapshot)
+        else jobSnapshots.failure = "Could not refresh jobs snapshot" end
+    end)
+end
+local function getJobState()
+    root()
+    local jobs = jobsController()
+    watchJobSnapshots()
+    if not jobSnapshots.value then refreshJobState() end
+    local snapshot = jobSnapshots.value
+    assert(snapshot, jobSnapshots.failure or "Loading accepted jobs")
+    for _, name in ipairs({ "GetPhase", "GetLegCount", "GetBankedCount", "HasDeliveredCurrent" }) do
+        assert(type(jobs[name]) == "function", "JobsController API unavailable: " .. name)
+    end
+    local count, banked = jobs:GetLegCount(), jobs:GetBankedCount()
+    if count ~= snapshot.legCount or banked ~= snapshot.banked then
+        refreshJobState()
+        error("Synchronizing accepted jobs with the server", 0)
+    end
+    local phase = jobs:GetPhase()
+    local drop = phase == "running" and jobs:GetDropPoint() or nil
+    return {
+        phase = phase, legCount = count, banked = banked, index = snapshot.index,
+        delivered = jobs:HasDeliveredCurrent(), revision = jobSnapshots.revision,
+        drop = drop and location(drop) or nil,
+    }
+end
+
 -- Default Roblox controls run at Input (100); the supplied SpeedstersMovement runs
 -- at Input+1 (101). While steering, suspend only default player input, write MoveDirection
 -- at 100, and let the game's own momentum step apply its normal velocity at 101.
@@ -635,6 +807,48 @@ local driveGoal
 local ownedControls
 local movementProblem
 local movementBindingError
+local function clearNavigation(goal)
+    local navigation = goal and goal.navigation
+    if not navigation then return end
+    goal.navigation = nil
+    if navigation.thread and coroutine.status(navigation.thread) ~= "dead" then pcall(task.cancel, navigation.thread) end
+    if navigation.blockedConnection then navigation.blockedConnection:Disconnect() end
+    if navigation.path then pcall(function() navigation.path:Destroy() end) end
+end
+
+local function findRoute(goal, part)
+    local navigation = { loading = true, started = os.clock(), index = 2 }
+    goal.navigation = navigation
+    local origin = part.Position
+    local delta = goal.target - origin
+    -- Plan only a local segment: far delivery markers can be tens of thousands of studs away.
+    local destination = origin + delta * math.min(1, 192 / math.max(delta.Magnitude, 1))
+    navigation.thread = task.spawn(function()
+        local found, failure = pcall(function()
+            local path = game:GetService("PathfindingService"):CreatePath({
+                AgentRadius = math.max(2, part.Size.X / 2),
+                AgentHeight = math.max(5, goal.humanoid.HipHeight * 2 + part.Size.Y),
+                AgentCanJump = true, WaypointSpacing = 6,
+            })
+            navigation.path = path
+            path:ComputeAsync(origin, destination)
+            if not session.alive or driveGoal ~= goal or goal.navigation ~= navigation then return end
+            assert(path.Status == Enum.PathStatus.Success, "No walkable route available yet")
+            local waypoints = path:GetWaypoints()
+            assert(#waypoints >= 2, "Route has no next waypoint")
+            navigation.waypoints = waypoints
+            navigation.blockedConnection = path.Blocked:Connect(function(index)
+                if index >= navigation.index then navigation.blocked = true end
+            end)
+        end)
+        if not session.alive or driveGoal ~= goal or goal.navigation ~= navigation then return end
+        navigation.loading = false
+        if not found then
+            navigation.failure = tostring(failure)
+            navigation.retryAt = os.clock() + 3
+        end
+    end)
+end
 local function playerControls()
     if controlsCache.value then return controlsCache.value end
     if not controlsCache.loading and os.clock() >= controlsCache.retry then
@@ -664,6 +878,7 @@ end
 local function stopDeliveryMovement()
     local previous = driveGoal
     driveGoal = nil
+    clearNavigation(previous)
     if previous and previous.humanoid.Parent then
         pcall(function() previous.humanoid:Move(Vector3.zero, false) end)
     end
@@ -674,10 +889,12 @@ local function stopDeliveryMovement()
         if not restored then log("Could not restore player input: " .. tostring(err), true) end
     end
 end
-local function beginDrive(target, phase, stopRadius)
+local function beginDrive(target, phase, stopRadius, kind)
+    kind = kind or "drop"
     if movementBindingError then error(movementBindingError, 0) end
     local part = root()
-    if part.Parent:GetAttribute("PlayerState") ~= "RunWorld" then
+    local playerState = part.Parent:GetAttribute("PlayerState")
+    if playerState ~= "RunWorld" and not (kind ~= "drop" and playerState == "Main") then
         stopDeliveryMovement()
         error("Waiting for RunWorld movement", 0)
     end
@@ -690,12 +907,22 @@ local function beginDrive(target, phase, stopRadius)
         if not disabled then stopDeliveryMovement(); error(tostring(err), 0) end
     end
     local changed = not driveGoal or driveGoal.character ~= part.Parent or driveGoal.phase ~= phase
-    driveGoal = {
-        target = target, phase = phase, stopRadius = stopRadius or Movement.STOP_RADIUS,
-        character = part.Parent, humanoid = part.Parent:FindFirstChildOfClass("Humanoid"),
-    }
-    if changed then movementProblem = nil end
+        or driveGoal.kind ~= kind or (driveGoal.target - target).Magnitude > 2
+    if changed then
+        clearNavigation(driveGoal)
+        driveGoal = {
+            target = target, phase = phase, kind = kind, stopRadius = stopRadius or Movement.STOP_RADIUS,
+            character = part.Parent, humanoid = part.Parent:FindFirstChildOfClass("Humanoid"),
+        }
+        movementProblem = nil
+    end
     return true
+end
+
+local function enableRouteRecovery()
+    assert(driveGoal, "Movement goal unavailable")
+    driveGoal.routing = true
+    if driveGoal.kind == "drop" then driveGoal.stopRadius = 8 end
 end
 local function steerDelivery(dt)
     local goal = driveGoal
@@ -704,7 +931,8 @@ local function steerDelivery(dt)
         stopDeliveryMovement()
         return
     end
-    if goal.character:GetAttribute("PlayerState") ~= "RunWorld" then
+    local playerState = goal.character:GetAttribute("PlayerState")
+    if playerState ~= "RunWorld" and not (goal.kind ~= "drop" and playerState == "Main") then
         movementProblem = "Waiting for RunWorld movement"
         stopDeliveryMovement()
         return
@@ -715,16 +943,55 @@ local function steerDelivery(dt)
         return
     end
     local target = goal.target
-    if goal.phase == "running" then
+    if goal.kind == "drop" then
         local live = jobs:GetDropPoint()
         if not live then stopDeliveryMovement(); return end
         target = location(live).Position
+        if (goal.target - target).Magnitude > 2 then
+            clearNavigation(goal)
+            goal.target = target
+        end
     end
     local part = root()
+    local stopRadius = goal.stopRadius
+    if goal.routing and (target - part.Position).Magnitude > stopRadius then
+        local navigation = goal.navigation
+        if navigation and (navigation.blocked or navigation.loading and os.clock() - navigation.started >= 8
+            or navigation.failure and os.clock() >= navigation.retryAt) then
+            clearNavigation(goal)
+            navigation = nil
+        end
+        if not navigation then
+            findRoute(goal, part)
+            navigation = goal.navigation
+        end
+        if navigation.loading or navigation.failure then
+            goal.humanoid:Move(Vector3.zero, false)
+            movementProblem = navigation.failure and "Route unavailable · retrying automatically" or "Finding a walkable route"
+            return
+        end
+        local waypoint = navigation.waypoints[navigation.index]
+        while waypoint and (part.Position - waypoint.Position).Magnitude <= 6 do
+            navigation.index = navigation.index + 1
+            waypoint = navigation.waypoints[navigation.index]
+        end
+        if not waypoint then
+            clearNavigation(goal)
+            goal.humanoid:Move(Vector3.zero, false)
+            return
+        end
+        target = waypoint.Position
+        stopRadius = 4
+        if waypoint.Action == Enum.PathWaypointAction.Jump and navigation.jumpedIndex ~= navigation.index
+            and (part.Position - target).Magnitude <= 14 then
+            goal.humanoid.Jump = true
+            navigation.jumpedIndex = navigation.index
+        end
+    end
     local delta = target - part.Position
     local velocity = part.AssemblyLinearVelocity
-    local x, z, state = Movement.steer(delta.X, delta.Y, delta.Z, velocity.X, velocity.Z, dt, goal.stopRadius)
-    movementProblem = state == "vertical" and "Delivery target needs vertical travel; use the game's route" or nil
+    local x, z, state = Movement.steer(delta.X, delta.Y, delta.Z, velocity.X, velocity.Z, dt, stopRadius)
+    movementProblem = state == "vertical" and "Vertical route needed · automatic recovery pending" or nil
     goal.humanoid:Move(Vector3.new(x, 0, z), false)
 end
 local steeringBinding = "SpeedstersBeyondDeliveryInput"
@@ -785,6 +1052,7 @@ local function ensureOrbIndex()
     for _, object in ipairs(workspace:GetDescendants()) do indexOrb(object) end
 end
 
+local returnOrigin
 local nextWarning = {}
 local reportedIssue = {}
 engine = Core.new({
@@ -817,28 +1085,16 @@ engine = Core.new({
     chargeStart = function() send("ChargeStart") end,
     chargeBurst = function() send("ChargeBurst") end,
     getAscensions = readAscensions,
-    getDropPoint = function()
-        root()
-        local value = jobsController():GetDropPoint()
-        if value == nil or value == false then return nil end
-        return location(value)
-    end,
-    getJobPhase = function()
-        root()
-        local jobs = jobsController()
-        if type(jobs.GetPhase) ~= "function" then error("JobsController phase API is unavailable", 0) end
-        local phase = jobs:GetPhase()
-        if type(phase) ~= "string" or phase == "" then error("Waiting for job phase to load", 0) end
-        return phase
-    end,
+    getJobState = getJobState,
+    refreshJobState = refreshJobState,
     getPlayerState = function()
         return player.Character and player.Character:GetAttribute("PlayerState")
     end,
     leaveJobPad = function()
         local part = root()
-        beginDrive(part.Position + part.CFrame.LookVector * 16, "claimed", 6)
+        beginDrive(part.Position + part.CFrame.LookVector * 16, "claimed", 6, "pad")
     end,
-    moveToBoard = function()
+    moveToBoard = function(phase)
         local geometry = workspace:FindFirstChild("ServerGeometry")
         local board = workspace:FindFirstChild("JobsPart") or (geometry and geometry:FindFirstChild("JobsPart"))
         if not board then error("Waiting for the job board to load", 0) end
@@ -848,10 +1104,28 @@ engine = Core.new({
         remote("CollectJob")
         local target = location(board).Position
         local distance = (root().Position - target).Magnitude
-        beginDrive(target, "idle", 6)
+        beginDrive(target, phase or jobsController():GetPhase(), 6, "board")
         return distance <= 10, distance
     end,
+    shouldReturnToSpawn = function()
+        local geometry = workspace:FindFirstChild("ServerGeometry")
+        local board = workspace:FindFirstChild("JobsPart") or (geometry and geometry:FindFirstChild("JobsPart"))
+        if not board then error("Waiting for the job board to load", 0) end
+        return (root().Position - location(board).Position).Magnitude > 200
+    end,
+    returnToSpawn = function()
+        local part = root()
+        local state = part.Parent:GetAttribute("PlayerState")
+        assert(state == "Main" or state == "RunWorld" or state == "Race", "Waiting until Return to Spawn is available")
+        returnOrigin = { character = part.Parent, position = part.Position }
+        send("ReturnToSpawn")
+    end,
+    hasReturnedToSpawn = function()
+        local part = root()
+        return returnOrigin ~= nil and (part.Parent ~= returnOrigin.character or (part.Position - returnOrigin.position).Magnitude > 15)
+    end,
     claimJob = function(tier, slot) send("ClaimJob", tier, slot) end,
+    appendJob = function(tier) send("ClaimJob", tier) end,
     isAtBoard = function()
         local geometry = workspace:FindFirstChild("ServerGeometry")
         local board = workspace:FindFirstChild("JobsPart") or (geometry and geometry:FindFirstChild("JobsPart"))
@@ -859,6 +1133,20 @@ engine = Core.new({
     end,
     moveToDrop = function(drop) return beginDrive(location(drop).Position, "running") end,
     sameDropPoint = function(first, second) return (location(first).Position - location(second).Position).Magnitude <= 2 end,
+    recoverJobMovement = function(phase, drop)
+        if phase == "running" then
+            beginDrive(location(drop).Position, phase, 8)
+        elseif phase == "claimed" then
+            local part = root()
+            beginDrive(part.Position + part.CFrame.LookVector * 24, phase, 6, "pad")
+        else
+            local geometry = workspace:FindFirstChild("ServerGeometry")
+            local board = workspace:FindFirstChild("JobsPart") or (geometry and geometry:FindFirstChild("JobsPart"))
+            if not board then error("Waiting for the job board to load", 0) end
+            beginDrive(location(board).Position, jobsController():GetPhase(), 6, "board")
+        end
+        enableRouteRecovery()
+    end,
     getDeliveryMovementProblem = function() return movementProblem end,
     getDropDistance = function(drop) return (root().Position - location(drop).Position).Magnitude end,
     stopDeliveryMovement = stopDeliveryMovement,
@@ -1153,32 +1441,32 @@ toggle(pages.Training, "farm", "Treadmill training", "Moves to your selection an
 toggle(pages.Training, "orbs", "Nearby orb collection", "Collects the nearest detected orb within 80 studs, with a retry cooldown.", 3, true)
 paragraph(pages.Training, "Treadmills refresh when you open the selector. Missing or streamed-out targets pause the action and show a retry status.", 94, 4)
 
-heading(pages.Jobs, "A SMOOTHER DELIVERY LOOP", "Jobs & delivery", "One request at a time. A delivery must appear before the controller heads to its destination.")
-toggle(pages.Jobs, "jobs", "Auto job & deliver", "Picks the highest-paying tier unlocked by your ascensions, then delivers and collects.", 1, true)
-local jobSelection = card(pages.Jobs, 224, 2)
+heading(pages.Jobs, "A COMPLETE DELIVERY LOOP", "Jobs & delivery", "Fill unlocked slots, deliver the chain, return to spawn and collect at the NPC.")
+toggle(pages.Jobs, "jobs", "Auto job & deliver", "Fills up to four slots with your best eligible tier, delivers, collects and repeats.", 1, true)
+local jobSelection = card(pages.Jobs, 244, 2)
 local jobSelectionTitle = label(jobSelection, "BEST ELIGIBLE JOB", 10, palette.muted, true)
 jobSelectionTitle.Position = UDim2.fromOffset(14, 10)
 jobSelectionTitle.Size = UDim2.new(1, -28, 0, 20)
 local jobPreview = label(jobSelection, "Checking ascensions…", 12, palette.accent)
 jobPreview.Position = UDim2.fromOffset(14, 34)
-jobPreview.Size = UDim2.new(1, -28, 0, 48)
+jobPreview.Size = UDim2.new(1, -28, 0, 64)
 jobPreview.TextWrapped = true
 jobPreview.TextTruncate = Enum.TextTruncate.None
 local countInput = create("TextBox", {
     Name = "AscensionCount", Text = "", PlaceholderText = "Current ascensions", ClearTextOnFocus = false,
     Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = palette.text, PlaceholderColor3 = palette.muted,
     BackgroundColor3 = palette.panel, BorderSizePixel = 0,
-    Position = UDim2.fromOffset(14, 92), Size = UDim2.new(1, -132, 0, 40),
+    Position = UDim2.fromOffset(14, 110), Size = UDim2.new(1, -132, 0, 40),
 }, jobSelection)
 round(countInput, 8)
 local useCount = button(jobSelection, "Use count", palette.panel)
-useCount.Position = UDim2.new(1, -108, 0, 92)
+useCount.Position = UDim2.new(1, -108, 0, 110)
 useCount.Size = UDim2.fromOffset(94, 40)
 local detectCount = button(jobSelection, "Use automatic detection", palette.panel)
-detectCount.Position = UDim2.fromOffset(14, 142)
+detectCount.Position = UDim2.fromOffset(14, 160)
 detectCount.Size = UDim2.new(1, -28, 0, 36)
 local countNote = label(jobSelection, "Manual count is optional. Keep it current if you use it.", 11, palette.muted)
-countNote.Position = UDim2.fromOffset(14, 184)
+countNote.Position = UDim2.fromOffset(14, 202)
 countNote.Size = UDim2.new(1, -28, 0, 30)
 countNote.TextWrapped = true
 countNote.TextTruncate = Enum.TextTruncate.None
@@ -1204,9 +1492,9 @@ connect(detectCount.Activated, function()
     engine.due.movement = 0
     refreshControls()
 end)
-paragraph(pages.Jobs, "At 10 ascensions, Hard pays 10,000. Locked tiers are skipped. If a claim is not confirmed, the hub waits instead of downgrading to Easy.", 108, 3)
+paragraph(pages.Jobs, "Two chain slots are available initially, three at 10 ascensions, and four at 25. Each slot uses your highest-paying eligible tier and waits for acceptance.", 108, 3)
 paragraph(pages.Jobs, "During deliveries, race reset and ascension wait so they cannot interrupt movement. Purchases can continue in the background.", 94, 4)
-paragraph(pages.Jobs, "Auto Jobs steers your character while travelling. Turn it off or press Stop all to steer manually. Blocked travel pauses and returns control to you.", 108, 5)
+paragraph(pages.Jobs, "Travel, arrival and payout retries run automatically. Return to Spawn shortens the trip back after the chain. Turn Jobs off or press Stop all whenever you want control.", 108, 5)
 
 heading(pages.Tools, "SET THE PACE", "Background tools", "Independent controls, spaced requests and clear feedback. Everything starts off except idle prevention.")
 toggle(pages.Tools, "race", "Repeat race reset", "Requests ResetRace every 4 seconds. This does not complete races.", 1, false)
@@ -1221,7 +1509,11 @@ refreshControls = function()
         local statOK, count, source = pcall(readAscensions)
         if statOK then
             local candidate = Core.bestJob(count)
-            jobPreview.Text = string.format("%d ascensions (%s)\n%s · %s reward", count, source, candidate.name, tostring(candidate.reward))
+            local state = engine.jobState
+            local capacity = Core.chainCapacity(count)
+            local progress = state and string.format("%d/%d accepted · %d banked", state.legCount, capacity, state.banked)
+                or string.format("Up to %d jobs per chain", capacity)
+            jobPreview.Text = string.format("%d ascensions (%s)\n%s · %s reward\n%s", count, source, candidate.name, tostring(candidate.reward), progress)
             jobPreview.TextColor3 = palette.accent
         else
             jobPreview.Text = tostring(count)
