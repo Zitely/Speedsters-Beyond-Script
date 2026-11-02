@@ -236,7 +236,16 @@ local function adoptJobSnapshot(snapshot)
         legCount = contract and #contract.legs or 0,
         index = contract and contract.index or 0,
         banked = snapshot.banked,
+        drops = {},
     }
+    if contract then
+        for index, leg in ipairs(contract.legs) do
+            if type(leg) == "table" and leg.dropPoint ~= nil then
+                local valid, point = pcall(location, leg.dropPoint)
+                if valid then jobSnapshots.value.drops[index] = point end
+            end
+        end
+    end
     jobSnapshots.revision = jobSnapshots.revision + 1
     jobSnapshots.failure = nil
 end
@@ -276,6 +285,18 @@ local function refreshJobState()
         else jobSnapshots.failure = "Could not refresh jobs snapshot" end
     end)
 end
+local function activeDelivery(jobs, snapshot, phase)
+    local delivered = jobs:HasDeliveredCurrent()
+    if phase ~= "running" then return nil, delivered end
+    local point = snapshot and snapshot.drops[snapshot.index]
+    if point then
+        -- The client can keep the previous marker/completion flag while adopting a
+        -- newer server leg. Follow the server-selected point and banked progress.
+        return point, snapshot.banked >= snapshot.index
+    end
+    local live = jobs:GetDropPoint()
+    return live and location(live) or nil, delivered
+end
 local function getJobState()
     root()
     local jobs = jobsController()
@@ -283,20 +304,14 @@ local function getJobState()
     if not jobSnapshots.value then refreshJobState() end
     local snapshot = jobSnapshots.value
     assert(snapshot, jobSnapshots.failure or "Loading accepted jobs")
-    for _, name in ipairs({ "GetPhase", "GetLegCount", "GetBankedCount", "HasDeliveredCurrent" }) do
+    for _, name in ipairs({ "GetPhase", "HasDeliveredCurrent" }) do
         assert(type(jobs[name]) == "function", "JobsController API unavailable: " .. name)
     end
-    local count, banked = jobs:GetLegCount(), jobs:GetBankedCount()
-    if count ~= snapshot.legCount or banked ~= snapshot.banked then
-        refreshJobState()
-        error("Synchronizing accepted jobs with the server", 0)
-    end
     local phase = jobs:GetPhase()
-    local drop = phase == "running" and jobs:GetDropPoint() or nil
+    local drop, delivered = activeDelivery(jobs, snapshot, phase)
     return {
-        phase = phase, legCount = count, banked = banked, index = snapshot.index,
-        delivered = jobs:HasDeliveredCurrent(), revision = jobSnapshots.revision,
-        drop = drop and location(drop) or nil,
+        phase = phase, legCount = snapshot.legCount, banked = snapshot.banked, index = snapshot.index,
+        delivered = delivered, revision = jobSnapshots.revision, drop = drop,
     }
 end
 
@@ -445,9 +460,9 @@ local function steerDelivery(dt)
     end
     local target = goal.target
     if goal.kind == "drop" then
-        local live = jobs:GetDropPoint()
-        if not live then stopDeliveryMovement(); return end
-        target = location(live).Position
+        local live, delivered = activeDelivery(jobs, jobSnapshots.value, goal.phase)
+        if not live or delivered then stopDeliveryMovement(); return end
+        target = live.Position
         if (goal.target - target).Magnitude > 2 then
             clearNavigation(goal)
             goal.target = target
@@ -554,6 +569,45 @@ local function ensureOrbIndex()
 end
 
 local returnOrigin
+local spawnCenterCache = { retryAt = 0 }
+local function spawnCenterPosition()
+    local part = root()
+    local function usable(object)
+        return object and object:IsDescendantOf(workspace)
+            and (not object:IsA("SpawnLocation") or object.Enabled ~= false
+                and (object.Neutral ~= false or object.TeamColor == player.TeamColor))
+    end
+    local spawn = player.RespawnLocation
+    if not usable(spawn) then spawn = spawnCenterCache.object end
+    if not usable(spawn) then
+        spawn = nil
+        if os.clock() >= spawnCenterCache.retryAt then
+            spawnCenterCache.retryAt = os.clock() + 3
+            local named = workspace:FindFirstChild("SpawnCenter", true)
+            if named and pcall(location, named) then spawn = named end
+            if not spawn then
+                local geometry = workspace:FindFirstChild("ServerGeometry")
+                local board = workspace:FindFirstChild("JobsPart") or (geometry and geometry:FindFirstChild("JobsPart"))
+                local origin = board and location(board).Position or part.Position
+                local nearest = math.huge
+                for _, object in ipairs(workspace:GetDescendants()) do
+                    if object:IsA("SpawnLocation") and usable(object) then
+                        local distance = (object.Position - origin).Magnitude
+                        if distance < nearest then spawn, nearest = object, distance end
+                    end
+                end
+            end
+            spawnCenterCache.object = spawn
+        end
+    end
+    assert(spawn, "Waiting for the spawn center or an active SpawnLocation to load")
+    local target = location(spawn).Position
+    if spawn:IsA("SpawnLocation") then
+        local humanoid = part.Parent:FindFirstChildOfClass("Humanoid")
+        target = target + Vector3.new(0, spawn.Size.Y / 2 + humanoid.HipHeight + part.Size.Y / 2, 0)
+    end
+    return target
+end
 local nextWarning = {}
 local reportedIssue = {}
 engine = Core.new({
@@ -592,9 +646,9 @@ engine = Core.new({
         return player.Character and player.Character:GetAttribute("PlayerState")
     end,
     leaveJobPad = function()
-        local part = root()
-        beginDrive(part.Position + part.CFrame.LookVector * 16, "claimed", 6, "pad")
+        beginDrive(spawnCenterPosition(), jobsController():GetPhase(), 6, "pad")
     end,
+    isAtSpawnCenter = function() return (root().Position - spawnCenterPosition()).Magnitude <= 6 end,
     moveToBoard = function(phase)
         local geometry = workspace:FindFirstChild("ServerGeometry")
         local board = workspace:FindFirstChild("JobsPart") or (geometry and geometry:FindFirstChild("JobsPart"))
@@ -638,8 +692,7 @@ engine = Core.new({
         if phase == "running" then
             beginDrive(location(drop).Position, phase, 8)
         elseif phase == "claimed" then
-            local part = root()
-            beginDrive(part.Position + part.CFrame.LookVector * 24, phase, 6, "pad")
+            beginDrive(spawnCenterPosition(), jobsController():GetPhase(), 6, "pad")
         else
             local geometry = workspace:FindFirstChild("ServerGeometry")
             local board = workspace:FindFirstChild("JobsPart") or (geometry and geometry:FindFirstChild("JobsPart"))

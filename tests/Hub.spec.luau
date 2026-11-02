@@ -392,18 +392,21 @@ test("phase and world changes release steering immediately", function()
         s.destroy()
     end
 end)
-test("claimed phase leaves the pad using input and ignores stale drop points", function()
+test("pad exit walks to spawn center and finishes after the phase becomes running", function()
     local m = Mock.new()
     m.phase, m.legCount = "claimed", 3
-    local s = drive(m, m.vector(12920, 0, 0))
-    assert(humanoid(m).MoveDirection.Z == -1 and humanoid(m).MoveDirection.X == 0)
+    local s = drive(m, m.vector(0, 0, 12920))
+    assert(humanoid(m).MoveDirection.X == 1 and humanoid(m).MoveDirection.Z == 0)
     assert(#m.pivots == 0 and #m.calls == 0)
     m.phase = "running"; m.tick(0.5)
     assert(humanoid(m).MoveDirection.X == 1 and humanoid(m).MoveDirection.Z == 0)
-    advance(m, 1, 3); assert(#m.calls == 0)
+    assert(s.engine.jobs.departingToSpawn)
+    place(m, 40, 4); m.tick(1)
+    assert(not s.engine.jobs.departingToSpawn and humanoid(m).MoveDirection.Z > 0.99)
+    assert(#m.calls == 0)
     s.destroy()
 end)
-test("a job stuck in claimed automatically replans departure", function()
+test("a stalled departure replans toward the same spawn center", function()
     local m = Mock.new()
     m.phase, m.legCount = "claimed", 3
     local s = drive(m, m.vector(12920, 0, 0))
@@ -411,7 +414,7 @@ test("a job stuck in claimed automatically replans departure", function()
     assert(m.controls.controlsEnabled and #m.calls == 0)
     advance(m, 13.5, 20)
     assert(#m.pathRequests >= 1 and not m.controls.controlsEnabled)
-    assert(m.pathRequests[1].destination.Z == -24 and #m.calls == 0)
+    assert(m.pathRequests[1].destination.X == 40 and m.pathRequests[1].destination.Z == 0 and #m.calls == 0)
     s.destroy()
 end)
 test("delivery waits for RunWorld before acquiring input", function()
@@ -687,5 +690,94 @@ test("all unlocked slots retain the job type required by the successful first cl
         end
         s.destroy()
     end
+end)
+test("all four server-selected destinations finish while the client stays on its first completed marker", function()
+    local m = Mock.new()
+    m.player:SetAttribute("Ascensions", 25)
+    m.simulateMovement = true
+    m.phase, m.legCount, m.legIndex, m.banked = "running", 4, 1, 0
+    m.serverDrops = { m.vector(1000, 0, 0), m.vector(1000, 0, 500), m.vector(500, 0, 500), m.vector(500, 0, 0) }
+    m.clientDrop = m.serverDrops[1]
+    local arrivals = {}
+    m.onRemote = function(name)
+        if name == "ReportJobArrival" then
+            assert((root(m).Position - m.serverDrops[m.legIndex]).Magnitude <= 50)
+            table.insert(arrivals, m.legIndex)
+            m.banked += 1
+            m.delivered = true -- Client completion flag stays latched after the first leg.
+            if m.banked < 4 then m.legIndex += 1
+            else m.phase = "claimed" end
+        elseif name == "ReturnToSpawn" then
+            assert(m.banked == 4)
+            place(m, 20)
+            m.player.Character:SetAttribute("PlayerState", "Main")
+        elseif name == "CollectJob" then
+            assert(m.banked == 4 and root(m).Position.Magnitude <= 10)
+            m.legCount, m.banked, m.phase, m.delivered = 0, 0, "idle", false
+        else error("Unexpected request: " .. name) end
+    end
+    local s = drive(m, m.serverDrops[1])
+    for _ = 1, 60 * 60 do
+        m.frame(1/60)
+        if s.engine.deliveries == 4 then break end
+    end
+    assert(s.engine.deliveries == 4, s.engine.status.jobs.text)
+    assert(#arrivals == 4)
+    for index, arrived in ipairs(arrivals) do assert(index == arrived) end
+    s.destroy()
+end)
+test("snapshot counts and next-leg steering do not wait for stale client getters", function()
+    local m = Mock.new()
+    m.phase, m.legCount, m.legIndex, m.banked = "running", 4, 2, 1
+    m.clientLegCount, m.clientBanked, m.delivered = 1, 0, true
+    m.clientDrop = m.vector(1000, 0, 0)
+    m.serverDrops = { m.clientDrop, m.vector(0, 0, 1000), m.vector(-1000, 0, 0), m.vector(0, 0, -1000) }
+    local s = drive(m, m.clientDrop)
+    assert(not s.engine.status.jobs.problem)
+    assert(s.engine.jobState.index == 2 and s.engine.jobState.legCount == 4 and s.engine.jobState.banked == 1)
+    assert(humanoid(m).MoveDirection.Z == 1 and humanoid(m).MoveDirection.X == 0)
+    assert(not s.engine.jobState.delivered and #m.calls == 0)
+    s.destroy()
+end)
+test("future snapshot destinations are not followed before the server advances the index", function()
+    local m = Mock.new()
+    m.phase, m.legCount, m.legIndex, m.banked = "running", 4, 1, 1
+    m.serverDrops = { m.vector(20, 0, 0), m.vector(0, 0, 1000), m.vector(-1000, 0, 0), m.vector(0, 0, -1000) }
+    local s = drive(m, m.serverDrops[1])
+    advance(m, 0.5, 3)
+    assert(#m.calls == 0 and m.controls.controlsEnabled)
+    m.legIndex = 2; m.tick(3.5)
+    assert(humanoid(m).MoveDirection.Z == 1 and #m.calls == 0)
+    s.destroy()
+end)
+test("pad exit prefers the assigned spawn and excludes disabled or wrong-team spawns", function()
+    local m = Mock.new()
+    m.phase, m.legCount = "claimed", 3
+    local assigned = m.instance("SpawnLocation", "AssignedSpawn", m.workspace)
+    assigned.CFrame = m.environment.CFrame.new(m.vector(0, 0, 80))
+    m.player.RespawnLocation = assigned
+    local s = drive(m, m.vector(1000, 0, 0))
+    assert(humanoid(m).MoveDirection.Z == 1 and humanoid(m).MoveDirection.X == 0)
+    s.destroy()
+    assigned.Enabled = false
+    local enemy = m.instance("SpawnLocation", "EnemySpawn", m.workspace)
+    enemy.CFrame = m.environment.CFrame.new(m.vector(0, 0, 10))
+    enemy.Neutral, enemy.TeamColor, m.player.TeamColor = false, "red", "blue"
+    local second = m.load(BUNDLE)
+    m.toggle("Auto job & deliver"); m.tick(1)
+    assert(humanoid(m).MoveDirection.X == 1 and humanoid(m).MoveDirection.Z == 0)
+    second.destroy()
+end)
+test("missing spawn geometry waits and discovers it when streamed in without walking forward", function()
+    local m = Mock.new()
+    m.workspace:FindFirstChild("SpawnLocation"):Destroy()
+    m.phase, m.legCount = "claimed", 3
+    local s = drive(m, m.vector(1000, 0, 0))
+    assert(s.engine.status.jobs.problem and m.controls.controlsEnabled and humanoid(m).MoveDirection.Magnitude == 0)
+    local spawn = m.instance("SpawnLocation", "SpawnLocation", m.workspace)
+    spawn.CFrame = m.environment.CFrame.new(m.vector(-40, 0, 0))
+    advance(m, 0.5, 3)
+    assert(humanoid(m).MoveDirection.X == -1 and humanoid(m).MoveDirection.Z == 0)
+    s.destroy()
 end)
 print(string.format("%d UI/adapter tests passed (mock Roblox API)", passed))

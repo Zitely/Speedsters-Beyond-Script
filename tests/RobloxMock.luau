@@ -59,7 +59,7 @@ function Mock.new()
         if self._signals[key .. "Changed"] then self._signals[key .. "Changed"]:Fire() end
     end
     function methods:IsA(class)
-        return self.ClassName == class or class == "BasePart" and self.ClassName == "Part"
+        return self.ClassName == class or class == "BasePart" and (self.ClassName == "Part" or self.ClassName == "SpawnLocation")
     end
     function methods:GetAttribute(name)
         return self._props.attributes and self._props.attributes[name]
@@ -77,8 +77,8 @@ function Mock.new()
         end
         return result
     end
-    function methods:FindFirstChild(name)
-        for _, child in ipairs(self._children) do if child.Name == name then return child end end
+    function methods:FindFirstChild(name, recursive)
+        for _, child in ipairs(recursive and self:GetDescendants() or self._children) do if child.Name == name then return child end end
     end
     methods.WaitForChild = methods.FindFirstChild
     function methods:FindFirstChildOfClass(class)
@@ -185,14 +185,17 @@ function Mock.new()
     function mock.snapshot()
         local count = legCount()
         local legs = {}
-        for i = 1, count do legs[i] = { tier = 3, jobType = 1, dropPoint = mock.drop } end
+        for i = 1, count do legs[i] = { tier = 3, jobType = 1, dropPoint = mock.serverDrops and mock.serverDrops[i] or mock.drop } end
         return { banked = mock.banked or 0, contract = count > 0 and { index = mock.legIndex or 1, legs = legs } or nil }
     end
     module.value = {
-        GetLegCount = legCount,
-        GetBankedCount = function() return mock.banked or 0 end,
+        GetLegCount = function() return mock.clientLegCount or legCount() end,
+        GetBankedCount = function() return mock.clientBanked or mock.banked or 0 end,
         HasDeliveredCurrent = function() return mock.delivered == true end,
-        GetDropPoint = function() return mock.drop end,
+        GetDropPoint = function()
+            if mock.clientDrop ~= nil then return mock.clientDrop ~= false and mock.clientDrop or nil end
+            return mock.drop
+        end,
         GetPhase = phase,
     }
     local replicated = instance("ReplicatedStorage")
@@ -203,6 +206,7 @@ function Mock.new()
     instance("Part", "x10", treadmills)
     instance("Model", "x20", treadmills)
     instance("Part", "JobsPart", workspace)
+    instance("SpawnLocation", "SpawnLocation", workspace).CFrame = cframe(v(40, 0, 0))
     local services = {
         Players = { LocalPlayer = player }, ReplicatedStorage = replicated,
         CoreGui = instance("CoreGui"), UserInputService = instance("Input"), RunService = instance("RunService"),
@@ -311,6 +315,10 @@ function Mock.new()
     function mock.publishSnapshot()
         local snapshot = mock.snapshot()
         local key = tostring(legCount()) .. ":" .. tostring(mock.banked or 0) .. ":" .. tostring(mock.legIndex or 1)
+        for _, leg in ipairs(snapshot.contract and snapshot.contract.legs or {}) do
+            local point = leg.dropPoint
+            key ..= point and string.format(":%s,%s,%s", tostring(point.X), tostring(point.Y), tostring(point.Z)) or ":missing"
+        end
         if key ~= mock.lastSnapshotKey then
             mock.lastSnapshotKey = key
             remotes:FindFirstChild("JobsStateChanged").OnClientEvent:Fire(snapshot)
