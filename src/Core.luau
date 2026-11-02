@@ -206,8 +206,8 @@ function Core:stepJobs(now)
     assert(type(state.delivered) == "boolean", "Delivery acknowledgement unavailable")
     assert(state.phase ~= "running" or state.legCount > 0 and state.index >= 1, "Waiting for the active chain index")
     self.jobState = state
-    if state.phase == "idle" then job.departingToSpawn = nil end
-    if state.phase ~= "claimed" and not job.departingToSpawn then
+    if state.phase == "idle" then job.leavingPad = nil end
+    if state.phase ~= "claimed" and not job.leavingPad then
         job.leaveStarted, job.nextLeave, job.leaveRetryAt, job.leaveRecoveries, job.departurePhase = nil, nil, nil, nil, nil
     end
 
@@ -315,14 +315,14 @@ function Core:stepJobs(now)
         end
     end
 
-    if state.phase == "claimed" then job.departingToSpawn = true end
-    if job.departingToSpawn and state.phase == "running"
-        and (not self.adapter.isAtSpawnCenter or self.adapter.isAtSpawnCenter()) then
+    if state.phase == "claimed" then job.leavingPad = true end
+    if job.leavingPad and state.phase == "running"
+        and (not self.adapter.isClearOfPad or self.adapter.isClearOfPad()) then
         self.adapter.stopDeliveryMovement()
-        job.departingToSpawn = nil
+        job.leavingPad = nil
         job.leaveStarted, job.nextLeave, job.leaveRetryAt, job.leaveRecoveries, job.departurePhase = nil, nil, nil, nil, nil
     end
-    if job.departingToSpawn then
+    if job.leavingPad then
         job.phase = "leavePad"
         job.leaveStarted = job.leaveStarted or now
         if now - job.leaveStarted >= 12 then
@@ -331,7 +331,7 @@ function Core:stepJobs(now)
                 job.leaveRetryAt = now + recoveryDelay(job.leaveRecoveries)
             end
             if now < job.leaveRetryAt then
-                self:report("jobs", "Spawn-center route stalled · retrying automatically", true, "leave_recovery")
+                self:report("jobs", "Pad exit blocked · retrying another direction", true, "leave_recovery")
                 return 0.5
             end
             self:recoverMovement("claimed")
@@ -346,7 +346,7 @@ function Core:stepJobs(now)
             job.nextLeave = now + 4
             job.departurePhase = state.phase
         end
-        self:report("jobs", string.format("%d jobs accepted · walking to spawn center", state.legCount))
+        self:report("jobs", string.format("%d jobs accepted · stepping sideways off the pad", state.legCount))
         return 0.5
     end
     if state.phase ~= "running" then

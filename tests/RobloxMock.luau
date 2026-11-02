@@ -28,7 +28,10 @@ function Mock.new()
     vector.__mul = function(a, b) return v(a.X * b, a.Y * b, a.Z * b) end
     vector.__index = function(a, key) if key == "Magnitude" then return math.sqrt(a.X ^ 2 + a.Y ^ 2 + a.Z ^ 2) end end
     local cf = {}
-    cf.__index = function(_, key) if key == "LookVector" then return v(0, 0, -1) end end
+    cf.__index = function(_, key)
+        if key == "LookVector" then return v(0, 0, -1) end
+        if key == "RightVector" then return v(1, 0, 0) end
+    end
     cf.__add = function(a, b) return setmetatable({ Position = a.Position + b, kind = "CFrame" }, cf) end
     local function cframe(value) return setmetatable({ Position = value or v(0, 0, 0), kind = "CFrame" }, cf) end
     local function udim(scale, offset) return { Scale = scale, Offset = offset } end
@@ -206,7 +209,6 @@ function Mock.new()
     instance("Part", "x10", treadmills)
     instance("Model", "x20", treadmills)
     instance("Part", "JobsPart", workspace)
-    instance("SpawnLocation", "SpawnLocation", workspace).CFrame = cframe(v(40, 0, 0))
     local services = {
         Players = { LocalPlayer = player }, ReplicatedStorage = replicated,
         CoreGui = instance("CoreGui"), UserInputService = instance("Input"), RunService = instance("RunService"),

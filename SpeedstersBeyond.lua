@@ -208,8 +208,8 @@ function Core:stepJobs(now)
     assert(type(state.delivered) == "boolean", "Delivery acknowledgement unavailable")
     assert(state.phase ~= "running" or state.legCount > 0 and state.index >= 1, "Waiting for the active chain index")
     self.jobState = state
-    if state.phase == "idle" then job.departingToSpawn = nil end
-    if state.phase ~= "claimed" and not job.departingToSpawn then
+    if state.phase == "idle" then job.leavingPad = nil end
+    if state.phase ~= "claimed" and not job.leavingPad then
         job.leaveStarted, job.nextLeave, job.leaveRetryAt, job.leaveRecoveries, job.departurePhase = nil, nil, nil, nil, nil
     end
 
@@ -317,14 +317,14 @@ function Core:stepJobs(now)
         end
     end
 
-    if state.phase == "claimed" then job.departingToSpawn = true end
-    if job.departingToSpawn and state.phase == "running"
-        and (not self.adapter.isAtSpawnCenter or self.adapter.isAtSpawnCenter()) then
+    if state.phase == "claimed" then job.leavingPad = true end
+    if job.leavingPad and state.phase == "running"
+        and (not self.adapter.isClearOfPad or self.adapter.isClearOfPad()) then
         self.adapter.stopDeliveryMovement()
-        job.departingToSpawn = nil
+        job.leavingPad = nil
         job.leaveStarted, job.nextLeave, job.leaveRetryAt, job.leaveRecoveries, job.departurePhase = nil, nil, nil, nil, nil
     end
-    if job.departingToSpawn then
+    if job.leavingPad then
         job.phase = "leavePad"
         job.leaveStarted = job.leaveStarted or now
         if now - job.leaveStarted >= 12 then
@@ -333,7 +333,7 @@ function Core:stepJobs(now)
                 job.leaveRetryAt = now + recoveryDelay(job.leaveRecoveries)
             end
             if now < job.leaveRetryAt then
-                self:report("jobs", "Spawn-center route stalled · retrying automatically", true, "leave_recovery")
+                self:report("jobs", "Pad exit blocked · retrying another direction", true, "leave_recovery")
                 return 0.5
             end
             self:recoverMovement("claimed")
@@ -348,7 +348,7 @@ function Core:stepJobs(now)
             job.nextLeave = now + 4
             job.departurePhase = state.phase
         end
-        self:report("jobs", string.format("%d jobs accepted · walking to spawn center", state.legCount))
+        self:report("jobs", string.format("%d jobs accepted · stepping sideways off the pad", state.legCount))
         return 0.5
     end
     if state.phase ~= "running" then
@@ -838,6 +838,7 @@ end
 -- at 100, and let the game's own momentum step apply its normal velocity at 101.
 local controlsCache = { loading = false, retry = 0 }
 local driveGoal
+local padExit
 local ownedControls
 local movementProblem
 local movementBindingError
@@ -925,6 +926,7 @@ local function stopDeliveryMovement()
 end
 local function beginDrive(target, phase, stopRadius, kind)
     kind = kind or "drop"
+    if kind ~= "pad" then padExit = nil end
     if movementBindingError then error(movementBindingError, 0) end
     local part = root()
     local playerState = part.Parent:GetAttribute("PlayerState")
@@ -1087,44 +1089,32 @@ local function ensureOrbIndex()
 end
 
 local returnOrigin
-local spawnCenterCache = { retryAt = 0 }
-local function spawnCenterPosition()
+local function padExitTarget(retry)
     local part = root()
-    local function usable(object)
-        return object and object:IsDescendantOf(workspace)
-            and (not object:IsA("SpawnLocation") or object.Enabled ~= false
-                and (object.Neutral ~= false or object.TeamColor == player.TeamColor))
+    if not padExit or padExit.character ~= part.Parent or padExit.job ~= engine.jobs then
+        -- Capture the original heading once. Auto-rotation during a sidestep must
+        -- not turn repeated requests into a curve back toward the board NPC.
+        local right = Vector3.new(part.CFrame.RightVector.X, 0, part.CFrame.RightVector.Z)
+        local forward = Vector3.new(part.CFrame.LookVector.X, 0, part.CFrame.LookVector.Z)
+        padExit = {
+            character = part.Parent, job = engine.jobs, attempt = 0,
+            right = right.Magnitude > 0.01 and right / right.Magnitude or Vector3.new(1, 0, 0),
+            forward = forward.Magnitude > 0.01 and forward / forward.Magnitude or Vector3.new(0, 0, -1),
+        }
     end
-    local spawn = player.RespawnLocation
-    if not usable(spawn) then spawn = spawnCenterCache.object end
-    if not usable(spawn) then
-        spawn = nil
-        if os.clock() >= spawnCenterCache.retryAt then
-            spawnCenterCache.retryAt = os.clock() + 3
-            local named = workspace:FindFirstChild("SpawnCenter", true)
-            if named and pcall(location, named) then spawn = named end
-            if not spawn then
-                local geometry = workspace:FindFirstChild("ServerGeometry")
-                local board = workspace:FindFirstChild("JobsPart") or (geometry and geometry:FindFirstChild("JobsPart"))
-                local origin = board and location(board).Position or part.Position
-                local nearest = math.huge
-                for _, object in ipairs(workspace:GetDescendants()) do
-                    if object:IsA("SpawnLocation") and usable(object) then
-                        local distance = (object.Position - origin).Magnitude
-                        if distance < nearest then spawn, nearest = object, distance end
-                    end
-                end
-            end
-            spawnCenterCache.object = spawn
+    local reached = padExit.target and (part.Position - padExit.target).Magnitude <= 6
+    if retry then padExit.attempt = padExit.attempt + 1 end
+    if not padExit.target or retry or reached and jobsController():GetPhase() == "claimed" then
+        local direction = padExit.attempt % 3
+        local offset
+        if direction == 2 then
+            offset = padExit.forward * -28
+        else
+            offset = padExit.right * (direction == 0 and 24 or -24) - padExit.forward * 10
         end
+        padExit.target = part.Position + offset
     end
-    assert(spawn, "Waiting for the spawn center or an active SpawnLocation to load")
-    local target = location(spawn).Position
-    if spawn:IsA("SpawnLocation") then
-        local humanoid = part.Parent:FindFirstChildOfClass("Humanoid")
-        target = target + Vector3.new(0, spawn.Size.Y / 2 + humanoid.HipHeight + part.Size.Y / 2, 0)
-    end
-    return target
+    return padExit.target
 end
 local nextWarning = {}
 local reportedIssue = {}
@@ -1164,9 +1154,13 @@ engine = Core.new({
         return player.Character and player.Character:GetAttribute("PlayerState")
     end,
     leaveJobPad = function()
-        beginDrive(spawnCenterPosition(), jobsController():GetPhase(), 6, "pad")
+        beginDrive(padExitTarget(false), jobsController():GetPhase(), 6, "pad")
     end,
-    isAtSpawnCenter = function() return (root().Position - spawnCenterPosition()).Magnitude <= 6 end,
+    isClearOfPad = function()
+        local part = root()
+        return padExit ~= nil and padExit.job == engine.jobs and padExit.character == part.Parent
+            and padExit.target ~= nil and (part.Position - padExit.target).Magnitude <= 6
+    end,
     moveToBoard = function(phase)
         local geometry = workspace:FindFirstChild("ServerGeometry")
         local board = workspace:FindFirstChild("JobsPart") or (geometry and geometry:FindFirstChild("JobsPart"))
@@ -1210,7 +1204,7 @@ engine = Core.new({
         if phase == "running" then
             beginDrive(location(drop).Position, phase, 8)
         elseif phase == "claimed" then
-            beginDrive(spawnCenterPosition(), jobsController():GetPhase(), 6, "pad")
+            beginDrive(padExitTarget(true), jobsController():GetPhase(), 6, "pad")
         else
             local geometry = workspace:FindFirstChild("ServerGeometry")
             local board = workspace:FindFirstChild("JobsPart") or (geometry and geometry:FindFirstChild("JobsPart"))
