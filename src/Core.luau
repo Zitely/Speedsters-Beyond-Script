@@ -7,6 +7,7 @@ Core.ARRIVAL_RETRY = 3
 Core.ARRIVAL_ATTEMPTS = 5
 Core.RECOVERY_DELAY = 3
 Core.ARRIVAL_RECOVERY_DELAY = 10
+Core.IDLE_INTERVAL = 14 * 60
 
 -- Reward/eligibility data supplied from JobsConfig / JobRewards (2026-10-31).
 Core.JOBS = {
@@ -81,6 +82,9 @@ function Core:setEnabled(key, value)
     assert(self.enabled[key] ~= nil, "Unknown automation")
     if not self.running then return end
     self.enabled[key] = value == true
+    if key == "antiIdle" and not self.enabled[key] and self.adapter.stopIdleInput then
+        self.adapter.stopIdleInput()
+    end
     self.due[key] = 0
     self.failures[key] = 0
     self:report(key, value and "Ready" or "Off")
@@ -433,8 +437,21 @@ function Core:stepJobs(now)
     return 0.3
 end
 
+function Core:keepAlive(now)
+    if not self.running or not self.enabled.antiIdle then return end
+    self:run("antiIdle", "antiIdle", now, function()
+        if self.adapter.idleInput() == false then
+            self:report("antiIdle", "Waiting for mouse release")
+            return 1
+        end
+        self:report("antiIdle", "Idle click sent")
+        return Core.IDLE_INTERVAL
+    end)
+end
+
 function Core:tick(now)
     if not self.running then return end
+    self:keepAlive(now)
     if self.mode then
         self:run("movement", self.mode, now, function()
             if self.mode == "jobs" then return self:stepJobs(now) end

@@ -213,6 +213,12 @@ function Mock.new()
         Players = { LocalPlayer = player }, ReplicatedStorage = replicated,
         CoreGui = instance("CoreGui"), UserInputService = instance("Input"), RunService = instance("RunService"),
         VirtualUser = { CaptureController = function() end, ClickButton2 = function() mock.idleCount = (mock.idleCount or 0) + 1 end },
+        VirtualInputManager = { SendMouseButtonEvent = function(_, x, y, button, pressed, layer, repeatCount)
+            assert(button == 1 and repeatCount == 0 and layer ~= nil)
+            mock.inputEvents = mock.inputEvents or {}
+            table.insert(mock.inputEvents, { x = x, y = y, button = button, pressed = pressed, time = mock.clock })
+            if pressed then mock.idleCount = (mock.idleCount or 0) + 1 end
+        end },
         TweenService = { Create = function(_, object, _, props)
             return { Cancel = function() end, Play = function() for k, value in pairs(props) do object[k] = value end end }
         end },
@@ -235,6 +241,8 @@ function Mock.new()
         return path
     end }
     function services.UserInputService:GetFocusedTextBox() return nil end
+    function services.UserInputService:GetMouseLocation() return mock.mousePosition or v(400, 300) end
+    function services.UserInputService:IsMouseButtonPressed() return mock.mouseHeld == true end
     local enum = setmetatable({}, { __index = function(self, key)
         local group = setmetatable({}, { __index = function(_, member) return key .. "." .. member end })
         rawset(self, key, group)

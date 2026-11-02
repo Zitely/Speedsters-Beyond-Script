@@ -28,6 +28,7 @@ local function fixture()
         state.revision += 1
     end
     adapter.collectNearestOrb = function() table.insert(calls, { name = "orb" }); return state.orb end
+    adapter.idleInput = function() end
     local engine = Core.new(adapter)
     local function count(name)
         local total = 0
@@ -333,5 +334,44 @@ test("a new claimed phase gets a fresh departure window after a running leg", fu
     equal(departures, 2, "A previous departure timer delayed the next leg")
     equal(count("recoverJobMovement"), 0)
     equal(e.jobs.leaveStarted, 20)
+end)
+test("idle clicks run immediately and every 14 minutes without Idled events", function()
+    local e, _, _, _, adapter = fixture()
+    local clicks = 0
+    adapter.idleInput = function() clicks += 1 end
+    e:tick(500); equal(clicks, 1)
+    e:tick(1339.9); equal(clicks, 1)
+    e:keepAlive(1339.9); equal(clicks, 1)
+    e:tick(1340); equal(clicks, 2)
+    e:keepAlive(1340); equal(clicks, 2)
+    e:tick(10000); equal(clicks, 3, "Resuming after a delay must not send catch-up clicks")
+    equal(e.due.antiIdle, 10840)
+end)
+test("idle clicks stop and restart with the existing toggle and session lifecycle", function()
+    local e, _, _, _, adapter = fixture()
+    local clicks = 0
+    adapter.idleInput = function() clicks += 1 end
+    e:tick(0); equal(clicks, 1)
+    e:setEnabled("antiIdle", false)
+    e:tick(900); e:keepAlive(1000); equal(clicks, 1)
+    e:setEnabled("antiIdle", true)
+    e:tick(1001); equal(clicks, 2)
+    e:stopAll(); e:tick(2000); equal(clicks, 2)
+    e:setEnabled("antiIdle", true); e:destroy()
+    e:tick(3000); e:keepAlive(3000); equal(clicks, 2)
+end)
+test("failed or deferred idle clicks retry without claiming a 14-minute reset", function()
+    local e, _, _, _, adapter = fixture()
+    local attempts = 0
+    adapter.idleInput = function() attempts += 1; error("Input unavailable", 0) end
+    e:tick(0)
+    equal(attempts, 1); equal(e.status.antiIdle.problem, true)
+    e:keepAlive(0.5); equal(attempts, 1)
+    adapter.idleInput = function() attempts += 1; return false end
+    e:tick(1); equal(e.due.antiIdle, 2)
+    equal(e.status.antiIdle.text, "Waiting for mouse release")
+    adapter.idleInput = function() attempts += 1 end
+    e:tick(2); equal(attempts, 3)
+    equal(e.due.antiIdle, 842); equal(e.status.antiIdle.problem, false)
 end)
 print(string.format("%d controller tests passed", passed))

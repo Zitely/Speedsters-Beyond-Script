@@ -80,7 +80,9 @@ If travel makes no progress for 12 seconds, it retries automatically after a coo
 
 Requests alone do not prove acceptance or payment. The session counter records banked jobs cleared after a collection request, not a currency balance audit. The game API and configuration details above were supplied by the user; the full loop still needs live-game validation.
 
-Race reset and ascension pause while jobs control movement. **Repeat race reset** only calls `ResetRace`; it does not finish a race. **Auto buy upgrades** requests both Speed and Jump purchases and can spend available currency. Orb detection uses BasePart names containing `orb`, matching the supplied script's convention. Streaming and game updates may change what is available. Idle input depends on runtime support.
+Race reset and ascension pause while jobs control movement. **Repeat race reset** only calls `ResetRace`; it does not finish a race. **Auto buy upgrades** requests both Speed and Jump purchases and can spend available currency. Orb detection uses BasePart names containing `orb`, matching the supplied script's convention. Streaming and game updates may change what is available.
+
+**Idle prevention** sends a right click when enabled and every **14 minutes**, including while the panel is minimized. It runs on the hub's timer instead of waiting for Roblox's `Idled` event, to provide activity before the game's anti-kick rejoin countdown expires. Tools shows the time until the next click. It uses `VirtualInputManager` at the current mouse position, with `VirtualUser` as a fallback, and waits if you are holding the right mouse button. Turning the toggle off, using Stop all, or closing the hub stops the cycle; reloading replaces the old cycle. Unsupported input shows an error and retries. Input injection and the game's acceptance of that activity depend on the runtime; the actual in-game rejoin countdown still needs live verification.
 
 ## Development
 

@@ -76,7 +76,7 @@ test("close disconnects every listener and prevents all future requests", functi
     m.find("×").Activated:Fire()
     assert(not s.alive and activeConnections(m) == 0)
     m.tick(100); m.player.Idled:Fire()
-    assert(#m.calls == 1 and m.idleCount == nil)
+    assert(#m.calls == 1 and m.idleCount == 1)
 end)
 test("re-executing the bundle unloads the previous session", function()
     local m = Mock.new()
@@ -790,5 +790,113 @@ test("a full job chain exits the pad sideways without any spawn objects", functi
     assert(direction.X > 0 and direction.Z >= 0, "Pad departure pushed forward toward the NPC")
     assert(#m.calls == 0 and #m.pivots == 0)
     s.destroy()
+end)
+test("idle toggle clicks every 14 minutes while minimized and displays the next click", function()
+    local m = Mock.new()
+    m.mousePosition = m.vector(321, 456)
+    local s = m.load(BUNDLE)
+    m.tick(0)
+    assert(m.idleCount == 1 and #m.inputEvents == 2)
+    assert(m.inputEvents[1].pressed and not m.inputEvents[2].pressed)
+    assert(m.inputEvents[1].x == 321 and m.inputEvents[1].y == 456)
+    m.find("Idle click sent · next in 14:00", "TextLabel")
+    m.find("−").Activated:Fire()
+    m.tick(839); m.player.Idled:Fire()
+    assert(m.idleCount == 1)
+    m.find("Idle click sent · next in 0:01", "TextLabel")
+    m.tick(840); m.player.Idled:Fire()
+    assert(m.idleCount == 2 and #m.inputEvents == 4)
+    m.find("Idle click sent · next in 14:00", "TextLabel")
+    m.tick(1680); assert(m.idleCount == 3)
+    assert(#m.calls == 0 and #m.pivots == 0)
+    s.destroy()
+end)
+test("idle toggle and Stop all cancel scheduled clicks and enabling restarts immediately", function()
+    local m = Mock.new()
+    local s = m.load(BUNDLE)
+    m.tick(0); assert(m.idleCount == 1)
+    m.toggle("Idle prevention")
+    m.tick(840); m.player.Idled:Fire(); assert(m.idleCount == 1)
+    m.toggle("Idle prevention")
+    m.tick(841); assert(m.idleCount == 2)
+    m.find("Stop all").Activated:Fire()
+    m.tick(2000); m.player.Idled:Fire(); assert(m.idleCount == 2)
+    s.destroy()
+    m.tick(3000); assert(m.idleCount == 2)
+end)
+test("reloading idle protection leaves only one scheduled click cycle", function()
+    local m = Mock.new()
+    local first = m.load(BUNDLE)
+    m.tick(0); assert(m.idleCount == 1)
+    m.tick(500)
+    local second = m.load(BUNDLE)
+    m.tick(500); assert(m.idleCount == 2 and not first.alive)
+    m.tick(840); assert(m.idleCount == 2)
+    m.tick(1340); assert(m.idleCount == 3)
+    second.destroy()
+end)
+test("idle input falls back when VirtualInputManager is unavailable", function()
+    local m = Mock.new()
+    m.services.VirtualInputManager = nil
+    local s = m.load(BUNDLE)
+    m.tick(0); assert(m.idleCount == 1 and m.inputEvents == nil)
+    assert(not s.engine.status.antiIdle.problem)
+    m.tick(840); assert(m.idleCount == 2)
+    s.destroy()
+end)
+test("unsupported idle input reports failure and recovers without delaying 14 minutes", function()
+    local m = Mock.new()
+    local sendInput = m.services.VirtualInputManager.SendMouseButtonEvent
+    m.services.VirtualInputManager.SendMouseButtonEvent = function() error("Input blocked") end
+    m.services.VirtualUser.ClickButton2 = function() error("Input blocked") end
+    local s = m.load(BUNDLE)
+    m.tick(0)
+    assert(s.engine.status.antiIdle.problem and m.idleCount == nil)
+    assert(string.find(s.engine.status.antiIdle.text, "Idle clicks unavailable"))
+    m.services.VirtualInputManager.SendMouseButtonEvent = sendInput
+    m.tick(1)
+    assert(m.idleCount == 1 and not s.engine.status.antiIdle.problem)
+    assert(s.engine.due.antiIdle == 841)
+    s.destroy()
+end)
+test("idle input waits for a held mouse button and retries a failed release", function()
+    local m = Mock.new()
+    m.mouseHeld = true
+    local s = m.load(BUNDLE)
+    m.tick(0); assert(m.idleCount == nil and m.inputEvents == nil)
+    assert(s.engine.status.antiIdle.text == "Waiting for mouse release")
+    m.mouseHeld = false
+    local sendInput = m.services.VirtualInputManager.SendMouseButtonEvent
+    local releases = 0
+    m.services.VirtualInputManager.SendMouseButtonEvent = function(self, x, y, button, pressed, layer, repeatCount)
+        if not pressed then
+            releases += 1
+            if releases == 1 then error("Temporary release failure") end
+        end
+        sendInput(self, x, y, button, pressed, layer, repeatCount)
+    end
+    m.tick(1)
+    assert(m.idleCount == 1 and releases == 2 and not m.inputEvents[2].pressed)
+    assert(not s.engine.status.antiIdle.problem)
+    s.destroy()
+end)
+test("a failed idle click release is cleaned up when the toggle stops or hub closes", function()
+    for _, shutdown in ipairs({ "toggle", "close" }) do
+        local m = Mock.new()
+        local sendInput = m.services.VirtualInputManager.SendMouseButtonEvent
+        local blockRelease = true
+        m.services.VirtualInputManager.SendMouseButtonEvent = function(self, x, y, button, pressed, layer, repeatCount)
+            if not pressed and blockRelease then error("Release blocked") end
+            sendInput(self, x, y, button, pressed, layer, repeatCount)
+        end
+        local s = m.load(BUNDLE)
+        m.tick(0)
+        assert(m.idleCount == 1 and #m.inputEvents == 1 and s.engine.status.antiIdle.problem)
+        blockRelease = false
+        if shutdown == "toggle" then m.toggle("Idle prevention") else s.destroy() end
+        assert(#m.inputEvents == 2 and not m.inputEvents[2].pressed)
+        m.tick(1000); assert(m.idleCount == 1)
+        s.destroy()
+    end
 end)
 print(string.format("%d UI/adapter tests passed (mock Roblox API)", passed))

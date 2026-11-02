@@ -9,6 +9,7 @@ Core.ARRIVAL_RETRY = 3
 Core.ARRIVAL_ATTEMPTS = 5
 Core.RECOVERY_DELAY = 3
 Core.ARRIVAL_RECOVERY_DELAY = 10
+Core.IDLE_INTERVAL = 14 * 60
 
 -- Reward/eligibility data supplied from JobsConfig / JobRewards (2026-10-31).
 Core.JOBS = {
@@ -83,6 +84,9 @@ function Core:setEnabled(key, value)
     assert(self.enabled[key] ~= nil, "Unknown automation")
     if not self.running then return end
     self.enabled[key] = value == true
+    if key == "antiIdle" and not self.enabled[key] and self.adapter.stopIdleInput then
+        self.adapter.stopIdleInput()
+    end
     self.due[key] = 0
     self.failures[key] = 0
     self:report(key, value and "Ready" or "Off")
@@ -435,8 +439,21 @@ function Core:stepJobs(now)
     return 0.3
 end
 
+function Core:keepAlive(now)
+    if not self.running or not self.enabled.antiIdle then return end
+    self:run("antiIdle", "antiIdle", now, function()
+        if self.adapter.idleInput() == false then
+            self:report("antiIdle", "Waiting for mouse release")
+            return 1
+        end
+        self:report("antiIdle", "Idle click sent")
+        return Core.IDLE_INTERVAL
+    end)
+end
+
 function Core:tick(now)
     if not self.running then return end
+    self:keepAlive(now)
     if self.mode then
         self:run("movement", self.mode, now, function()
             if self.mode == "jobs" then return self:stepJobs(now) end
@@ -571,6 +588,7 @@ function session.destroy()
     if not session.alive then return end
     session.alive = false
     if engine then engine:destroy() end
+    if session.releaseIdleInput then session.releaseIdleInput() end
     if session.cancelJobSnapshot then session.cancelJobSnapshot() end
     for _, name in ipairs(session.renderBindings) do RunService:UnbindFromRenderStep(name) end
     for _, connection in ipairs(session.connections) do connection:Disconnect() end
@@ -1118,6 +1136,44 @@ local function padExitTarget(retry)
 end
 local nextWarning = {}
 local reportedIssue = {}
+local pendingIdleRelease
+local function releaseIdleInput()
+    if not pendingIdleRelease then return true end
+    local released = pcall(pendingIdleRelease)
+    if released then pendingIdleRelease = nil end
+    return released
+end
+session.releaseIdleInput = releaseIdleInput
+local function idleInput()
+    -- Retry our own unfinished click before checking for a player's held button.
+    assert(releaseIdleInput(), "Idle click release unavailable in this runtime")
+    -- A right click supplies activity without activating left-click GUI buttons.
+    -- Never release a mouse button the player is currently holding.
+    if Input:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then return false end
+    local inputOK, virtualInput = pcall(function() return game:GetService("VirtualInputManager") end)
+    if inputOK then
+        local point = Input:GetMouseLocation()
+        local pressed = pcall(function()
+            virtualInput:SendMouseButtonEvent(point.X, point.Y, 1, true, game, 0)
+        end)
+        if pressed then
+            pendingIdleRelease = function()
+                virtualInput:SendMouseButtonEvent(point.X, point.Y, 1, false, game, 0)
+            end
+            local released = releaseIdleInput()
+            if not released then released = releaseIdleInput() end
+            assert(released, "Idle click release unavailable in this runtime")
+            return true
+        end
+    end
+    local fallbackOK = pcall(function()
+        local virtualUser = game:GetService("VirtualUser")
+        virtualUser:CaptureController()
+        virtualUser:ClickButton2(Vector2.zero)
+    end)
+    assert(fallbackOK, "Idle clicks unavailable in this runtime")
+    return true
+end
 engine = Core.new({
     onStatus = function(key, text, problem, issue)
         -- UI status stays live; changing distances must not flood the console/feed.
@@ -1243,6 +1299,8 @@ engine = Core.new({
         buy:FireServer("Speed")
         buy:FireServer("Jump")
     end,
+    idleInput = idleInput,
+    stopIdleInput = releaseIdleInput,
 })
 session.engine = engine
 
@@ -1566,7 +1624,7 @@ heading(pages.Tools, "SET THE PACE", "Background tools", "Independent controls, 
 toggle(pages.Tools, "race", "Repeat race reset", "Requests ResetRace every 4 seconds. This does not complete races.", 1, false)
 toggle(pages.Tools, "ascend", "Auto ascend", "Requests ascension every 10 seconds; the server checks eligibility.", 2, false)
 toggle(pages.Tools, "buy", "Auto buy upgrades", "Requests Speed and Jump purchases every 5 seconds. Spends available currency.", 3, false)
-toggle(pages.Tools, "antiIdle", "Idle prevention", "Sends an idle input when supported by your client runtime.", 4, false)
+toggle(pages.Tools, "antiIdle", "Idle prevention", "Clicks when enabled, then every 14 minutes to keep the idle timer active.", 4, false)
 paragraph(pages.Tools, "Minimize or Right Shift hides the panel while automation continues. Close unloads the hub. Stop all disables every toggle, including idle prevention.", 108, 5)
 
 refreshControls = function()
@@ -1595,6 +1653,10 @@ refreshControls = function()
         end
         local status = engine.status[key]
         entry.state.Text = enabled and (status and status.text or "Ready") or "Off"
+        if key == "antiIdle" and enabled and status and not status.problem and (engine.due.antiIdle or 0) > 0 then
+            local remaining = math.max(0, math.ceil(engine.due.antiIdle - os.clock()))
+            entry.state.Text ..= string.format(" · next in %d:%02d", math.floor(remaining / 60), remaining % 60)
+        end
         entry.state.TextColor3 = enabled and (status and status.problem and palette.warning or palette.accent) or palette.muted
     end
     local names = { farm = "Treadmill training", orbs = "Orb collection", jobs = "Job deliveries" }
@@ -1721,14 +1783,7 @@ connect(Input.InputEnded, function(input)
     if drag and input == drag.input then drag = nil end
 end)
 connect(player.Idled, function()
-    if not engine.enabled.antiIdle then return end
-    local idleOk = pcall(function()
-        local virtualUser = game:GetService("VirtualUser")
-        virtualUser:CaptureController()
-        virtualUser:ClickButton2(Vector2.zero)
-    end)
-    if idleOk then engine:report("antiIdle", "Idle input sent")
-    else engine:report("antiIdle", "Idle input unavailable in this runtime", true) end
+    engine:keepAlive(os.clock())
     refreshControls()
 end)
 connect(player.CharacterAdded, function()
