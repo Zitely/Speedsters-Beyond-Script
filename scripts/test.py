@@ -2,6 +2,7 @@
 """Run controller tests, plus the real bundle against a small Roblox API double."""
 from pathlib import Path
 import os
+import re
 import subprocess
 import tempfile
 
@@ -12,9 +13,10 @@ subprocess.run([LUAU, str(ROOT / "tests/Core.spec.luau")], check=True, cwd=ROOT)
 subprocess.run([LUAU, str(ROOT / "tests/Movement.spec.luau")], check=True, cwd=ROOT)
 bundle = (ROOT / "SpeedstersBeyond.lua").read_text()
 loader = (ROOT / "Loader.lua").read_text()
-readme_loader = (ROOT / "README.md").read_text().split("```lua\n", 1)[1].split("```", 1)[0]
-if readme_loader != loader:
-    raise SystemExit("README loader differs from Loader.lua")
+readme_loader = (ROOT / "README.md").read_text().strip()
+loader_url = re.search(r'^local url = "([^"]+)"$', loader, re.MULTILINE).group(1)
+if readme_loader != f'loadstring(game:HttpGet("{loader_url}"))()':
+    raise SystemExit("README must contain only the one-line loadstring using the Loader.lua URL")
 assert "]====]" not in bundle
 fixture = "local BUNDLE = [====[" + bundle + "]====]\n"
 fixture += "local Mock = (function()\n" + (ROOT / "tests/RobloxMock.luau").read_text() + "\nend)()\n"
