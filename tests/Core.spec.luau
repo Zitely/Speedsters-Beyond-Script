@@ -170,7 +170,7 @@ test("four slots are filled one at a time with the highest-paying eligible job",
     end
     for _, call in ipairs(calls) do
         if call.name == "claimJob" then equal(call.args[1], 4); equal(call.args[2], 1)
-        elseif call.name == "appendJob" then equal(call.args[1], 4); equal(#call.args, 1) end
+        elseif call.name == "appendJob" then equal(call.args[1], 4); equal(call.args[2], 1); equal(#call.args, 2) end
     end
     state.legCount = 4
     advance(e, 15, 18)
@@ -187,7 +187,7 @@ test("each new slot rechecks eligibility without downgrading an existing claim",
     equal(count("claimJob"), 1); equal(count("appendJob"), 1)
     for _, call in ipairs(calls) do
         if call.name == "claimJob" then equal(call.args[1], 3)
-        elseif call.name == "appendJob" then equal(call.args[1], 9) end
+        elseif call.name == "appendJob" then equal(call.args[1], 9); equal(call.args[2], 2) end
     end
 end)
 test("delayed claims refresh authoritative state before automatically retrying", function()

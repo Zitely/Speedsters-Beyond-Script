@@ -302,8 +302,8 @@ function Core:stepJobs(now)
             if state.legCount == 0 and state.phase == "idle" then
                 self.adapter.claimJob(candidate.tier, candidate.jobType)
             elseif state.phase == "claimed" then
-                -- The supplied append handler accepts the tier only.
-                self.adapter.appendJob(candidate.tier)
+                -- Preserve the same payload as the successful first claim.
+                self.adapter.appendJob(candidate.tier, candidate.jobType)
             else
                 self:report("jobs", "Waiting for the board to accept another leg")
                 return 0.5
@@ -1134,7 +1134,7 @@ engine = Core.new({
         return returnOrigin ~= nil and (part.Parent ~= returnOrigin.character or (part.Position - returnOrigin.position).Magnitude > 15)
     end,
     claimJob = function(tier, slot) send("ClaimJob", tier, slot) end,
-    appendJob = function(tier) send("ClaimJob", tier) end,
+    appendJob = function(tier, jobType) send("ClaimJob", tier, jobType) end,
     isAtBoard = function()
         local geometry = workspace:FindFirstChild("ServerGeometry")
         local board = workspace:FindFirstChild("JobsPart") or (geometry and geometry:FindFirstChild("JobsPart"))

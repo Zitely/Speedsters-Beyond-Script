@@ -481,8 +481,8 @@ test("two complete four-job chains fill, deliver, return, collect and repeat wit
         if name == "ClaimJob" then
             assert(root(m).Position.Magnitude <= 10 and m.legCount < 4)
             assert(args[1] == 9, "Did not choose the highest-paying eligible tier")
-            if m.legCount == 0 then assert(#args == 2 and args[2] == 2)
-            else assert(m.phase == "claimed" and #args == 1) end
+            assert(#args == 2 and args[2] == 2)
+            if m.legCount > 0 then assert(m.phase == "claimed") end
             claimCount += 1
             m.legCount += 1
             m.legIndex, m.phase, m.delivered = 1, "claimed", false
@@ -658,5 +658,34 @@ test("Stop all cancels route recovery deferred until after a spawn wait", functi
     advance(m, 21.5, 40)
     assert(#m.calls == 2 and #m.pathRequests == 0 and m.controls.controlsEnabled)
     s.destroy()
+end)
+test("all unlocked slots retain the job type required by the successful first claim", function()
+    for _, case in ipairs({ { ascensions = 10, slots = 3, tier = 3, jobType = 1 },
+        { ascensions = 25, slots = 4, tier = 9, jobType = 2 },
+        { ascensions = 25, slots = 4, tier = 9, jobType = 2, accepted = 1 },
+        { ascensions = 75, slots = 4, tier = 4, jobType = 1 } }) do
+        local m = Mock.new()
+        m.player:SetAttribute("Ascensions", case.ascensions)
+        m.legCount, m.banked = case.accepted or 0, 0
+        m.phase = m.legCount > 0 and "claimed" or "idle"
+        m.onRemote = function(name, args)
+            if name ~= "ClaimJob" then return end
+            assert(root(m).Position.Magnitude <= 10)
+            -- Model a server that accepts the first request but rejects missing jobType.
+            if args[1] ~= case.tier or args[2] ~= case.jobType then return end
+            assert(m.legCount < case.slots, "Claim exceeded the unlocked chain capacity")
+            m.legCount += 1
+            m.legIndex, m.phase, m.delivered = 1, "claimed", false
+        end
+        local s = m.load(BUNDLE)
+        m.toggle("Auto job & deliver"); advance(m, 0, 8)
+        assert(m.legCount == case.slots, string.format("Only %d/%d slots accepted: %s", m.legCount, case.slots, s.engine.status.jobs.text))
+        assert(s.engine.jobState.legCount == case.slots)
+        assert(#m.calls == case.slots - (case.accepted or 0), "Existing accepted jobs were claimed again")
+        for _, call in ipairs(m.calls) do
+            assert(call.name == "ClaimJob" and call.args[1] == case.tier and call.args[2] == case.jobType)
+        end
+        s.destroy()
+    end
 end)
 print(string.format("%d UI/adapter tests passed (mock Roblox API)", passed))

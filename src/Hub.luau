@@ -626,7 +626,7 @@ engine = Core.new({
         return returnOrigin ~= nil and (part.Parent ~= returnOrigin.character or (part.Position - returnOrigin.position).Magnitude > 15)
     end,
     claimJob = function(tier, slot) send("ClaimJob", tier, slot) end,
-    appendJob = function(tier) send("ClaimJob", tier) end,
+    appendJob = function(tier, jobType) send("ClaimJob", tier, jobType) end,
     isAtBoard = function()
         local geometry = workspace:FindFirstChild("ServerGeometry")
         local board = workspace:FindFirstChild("JobsPart") or (geometry and geometry:FindFirstChild("JobsPart"))
