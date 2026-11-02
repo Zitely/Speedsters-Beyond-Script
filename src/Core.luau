@@ -145,7 +145,7 @@ function Core:travelToBoard(now, job, gamePhase)
         job.boardProgressAt = now
         job.spawnRequested = nil
         job.spawnFinished = nil
-        self:recoverMovement("idle")
+        job.boardNeedsRecovery = true
     end
     if self.adapter.shouldReturnToSpawn and self.adapter.shouldReturnToSpawn() and not job.spawnRequested then
         self.adapter.stopDeliveryMovement()
@@ -163,6 +163,12 @@ function Core:travelToBoard(now, job, gamePhase)
         job.spawnFinished = true
         job.boardProgressAt = now
         job.bestBoardDistance = nil
+    end
+    -- A spawn request stops steering. Start route recovery only after it settles,
+    -- otherwise stopping for the request discards the new route before it runs.
+    if job.boardNeedsRecovery then
+        self:recoverMovement("idle")
+        job.boardNeedsRecovery = nil
     end
     local reached, distance = self.adapter.moveToBoard(gamePhase)
     if reached ~= false then return true end
@@ -200,6 +206,9 @@ function Core:stepJobs(now)
     assert(type(state.delivered) == "boolean", "Delivery acknowledgement unavailable")
     assert(state.phase ~= "running" or state.legCount > 0 and state.index >= 1, "Waiting for the active chain index")
     self.jobState = state
+    if state.phase ~= "claimed" then
+        job.leaveStarted, job.nextLeave, job.leaveRetryAt, job.leaveRecoveries = nil, nil, nil, nil
+    end
 
     local pending = job.pendingClaim
     if pending and (state.legCount > pending.before or state.phase == "running") then

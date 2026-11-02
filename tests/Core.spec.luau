@@ -318,4 +318,20 @@ test("a partial payout counts only cleared jobs and continues collecting the rem
     state.banked, state.legCount, state.index, state.phase = 0, 0, 0, "idle"
     e:tick(2); equal(e.deliveries, 4)
 end)
+test("a new claimed phase gets a fresh departure window after a running leg", function()
+    local e, state, _, count, adapter = fixture()
+    local departures = 0
+    adapter.leaveJobPad = function() departures += 1 end
+    state.phase, state.legCount, state.index = "claimed", 3, 1
+    e:setMode("jobs"); e:tick(0)
+    equal(departures, 1)
+    running(state, 3, 2, 1)
+    state.distance = 1000
+    advance(e, 1, 10)
+    state.phase = "claimed"
+    e:tick(20)
+    equal(departures, 2, "A previous departure timer delayed the next leg")
+    equal(count("recoverJobMovement"), 0)
+    equal(e.jobs.leaveStarted, 20)
+end)
 print(string.format("%d controller tests passed", passed))
